@@ -536,44 +536,55 @@ if uploaded_file:
             help="Set ANTHROPIC_API_KEY in Streamlit Secrets to avoid entering this every time. Go to app Settings → Secrets."
         )
 
-    if "num_criteria" not in st.session_state:
-        st.session_state["num_criteria"] = 3
+    # ── Criteria stored as list in session_state for flexible add/remove/insert ──
+    if "criteria_rows" not in st.session_state:
+        st.session_state["criteria_rows"] = [
+            {"name": "Content is relevant to Mantle / web3 ecosystem", "weight": 1.0, "max_score": 10},
+            {"name": "Shows genuine effort — not AI-generated or lazy",  "weight": 1.0, "max_score": 10},
+            {"name": "Has a clear call to action or community value",    "weight": 0.8, "max_score":  8},
+        ]
 
-    col_add, col_remove, _ = st.columns([1, 1, 4])
-    if col_add.button("➕ Add Criterion"):
-        st.session_state["num_criteria"] += 1
-    if col_remove.button("➖ Remove Last") and st.session_state["num_criteria"] > 1:
-        st.session_state["num_criteria"] -= 1
+    rows = st.session_state["criteria_rows"]
 
-    n = st.session_state["num_criteria"]
+    # Handle add/remove/insert actions triggered from previous render
+    action = st.session_state.pop("cr_action", None)
+    if action:
+        act, idx = action
+        if act == "delete" and len(rows) > 1:
+            rows.pop(idx)
+        elif act == "insert":
+            rows.insert(idx + 1, {"name": "", "weight": 1.0, "max_score": 10})
 
     st.markdown("""
-<div style="display:grid;grid-template-columns:3fr 0.8fr 0.8fr;gap:8px;
+<div style="display:grid;grid-template-columns:3fr 0.8fr 0.8fr 0.5fr;gap:8px;
             padding:8px 12px;background:#F4FBF7;border-radius:8px;margin-bottom:4px;">
   <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Criterion Description</span>
   <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Weight</span>
   <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Max Score</span>
+  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Actions</span>
 </div>
 """, unsafe_allow_html=True)
 
     criteria_list = []
-    default_criteria = [
-        ("Content is relevant to Mantle / web3 ecosystem", 1.0, 10),
-        ("Shows genuine effort — not AI-generated or lazy",  1.0, 10),
-        ("Has a clear call to action or community value",    0.8,  8),
-    ]
-
-    for i in range(n):
-        c1, c2, c3 = st.columns([3, 0.8, 0.8])
-        def_name   = default_criteria[i][0] if i < len(default_criteria) else f"Criterion {i+1}"
-        def_weight = default_criteria[i][1] if i < len(default_criteria) else 1.0
-        def_max    = default_criteria[i][2] if i < len(default_criteria) else 10
-
-        name   = c1.text_input("Description", value=def_name,   key=f"cr_name_{i}", label_visibility="collapsed",
+    for i, row in enumerate(rows):
+        c1, c2, c3, c4 = st.columns([3, 0.8, 0.8, 0.5])
+        name   = c1.text_input("Description", value=row["name"],       key=f"cr_name_{i}", label_visibility="collapsed",
                                 placeholder="Describe what to evaluate...")
-        weight = c2.number_input("Weight",     value=def_weight, key=f"cr_w_{i}",    label_visibility="collapsed", min_value=0.0, step=0.1)
-        max_sc = c3.number_input("Max",        value=def_max,    key=f"cr_max_{i}",  label_visibility="collapsed", min_value=1,   step=1)
+        weight = c2.number_input("Weight",     value=row["weight"],     key=f"cr_w_{i}",    label_visibility="collapsed", min_value=0.0, step=0.1)
+        max_sc = c3.number_input("Max",        value=row["max_score"],  key=f"cr_max_{i}",  label_visibility="collapsed", min_value=1,   step=1)
 
+        # ── Inline action buttons ──
+        btn_col1, btn_col2 = c4.columns(2)
+        if btn_col1.button("＋", key=f"cr_add_{i}", help="Insert new criterion below"):
+            st.session_state["cr_action"] = ("insert", i)
+            st.rerun()
+        if btn_col2.button("✕", key=f"cr_del_{i}", help="Remove this criterion",
+                           disabled=(len(rows) <= 1)):
+            st.session_state["cr_action"] = ("delete", i)
+            st.rerun()
+
+        # Persist current values back into session state
+        rows[i] = {"name": name, "weight": weight, "max_score": max_sc}
         criteria_list.append({"name": name, "weight": weight, "max_score": max_sc})
 
     st.markdown('<div class="section-label">🚀 Run Analysis</div>', unsafe_allow_html=True)
