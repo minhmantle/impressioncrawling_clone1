@@ -315,6 +315,19 @@ def fetch_x_metrics(tid):
             bookmarks = tweet.get("bookmarks", 0)
             views     = tweet.get("views", 0)
             engagement = likes + retweets + quotes + bookmarks
+            raw_text   = tweet.get("text", "")
+            # Detect X Article: fxtwitter sets source or article field, or text ends with truncation link
+            is_article = bool(
+                tweet.get("article") or
+                tweet.get("card") or
+                (raw_text.endswith("…") and "https://t.co/" in raw_text) or
+                len(raw_text) > 500
+            )
+            # For articles, try to get article body if available
+            article_body = ""
+            if tweet.get("article"):
+                article_body = str(tweet["article"].get("text") or tweet["article"].get("title") or "")[:1200]
+            content_text = (article_body or raw_text)[:600]
             return {
                 "impressions": views,
                 "likes": likes,
@@ -323,17 +336,18 @@ def fetch_x_metrics(tid):
                 "bookmarks": bookmarks,
                 "replies": tweet.get("replies", 0),
                 "engagement": engagement,
-                "content": tweet.get("text", "")[:600],
+                "content": content_text,
+                "is_article": is_article,
                 "error": ""
             }
         else:
             return {"impressions":0,"likes":0,"retweets":0,"quotes":0,
                     "bookmarks":0,"replies":0,"engagement":0,"content":"",
-                    "error": f"HTTP {resp.status_code}"}
+                    "is_article":False,"error": f"HTTP {resp.status_code}"}
     except Exception as e:
         return {"impressions":0,"likes":0,"retweets":0,"quotes":0,
                 "bookmarks":0,"replies":0,"engagement":0,"content":"",
-                "error": str(e)[:100]}
+                "is_article":False,"error": str(e)[:100]}
 
 # ====================== HEADER ======================
 st.markdown("""
@@ -357,7 +371,7 @@ uploaded_file = st.file_uploader(
 
 
 # ====================== SCORING FUNCTION (AI) ======================
-def score_content_ai(text: str, criteria: list, api_key: str) -> dict:
+def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool = False) -> dict:
     """AI scoring using Claude — chain-of-thought reasoning before scoring."""
     import json as _json
     if not text or not str(text).strip() or str(text).strip().lower() in ("nan", "none", ""):
@@ -371,6 +385,14 @@ def score_content_ai(text: str, criteria: list, api_key: str) -> dict:
         for i, cr in enumerate(criteria)
     )
 
+    content_type = "X Article (long-form — text below is truncated, full article not available)" if is_article else "Tweet"
+    article_note = (
+        "NOTE: This is an X Article. Only a truncated preview is available. "
+        "Score based on what you can read — acknowledge in your reasoning that this is partial content "
+        "and avoid penalizing for missing context you cannot see. "
+        "Do NOT give 0 just because the content is cut off."
+    ) if is_article else ""
+
     prompt = f"""You are an expert content evaluator for Mantle, a leading Ethereum Layer 2 blockchain network.
 
 ABOUT MANTLE:
@@ -380,8 +402,10 @@ ABOUT MANTLE:
 - Content does NOT need to explicitly mention "Mantle" or "MNT" to be relevant — discussing Web3, DeFi, L2, or crypto topics counts
 - "Not AI-generated" means: personal voice, specific details, opinions, imperfections, storytelling, genuine enthusiasm — NOT generic buzzwords, templated structure, or overly polished marketing speak
 
-TWEET TO EVALUATE:
+CONTENT TO EVALUATE ({content_type}):
 "{text}"
+
+{article_note}
 
 SCORING CRITERIA:
 {criteria_block}
@@ -685,6 +709,7 @@ if uploaded_file:
                                 "Replies_Comments": metrics["replies"],
                                 "Engagement":       metrics["engagement"],
                                 "Content":          metrics["content"],
+                                "Is_Article":       metrics.get("is_article", False),
                                 "Error":            metrics.get("error", "")
                             })
 
@@ -745,7 +770,8 @@ if uploaded_file:
             score_rows = []
             for idx_s, txt in enumerate(scored_df["Content"].fillna("")):
                 score_placeholder.info(f"🤖 AI scoring post {idx_s+1} / {len(scored_df)}...")
-                score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key))
+                is_art = bool(scored_df.get("Is_Article", pd.Series([False]*len(scored_df))).iloc[idx_s]) if "Is_Article" in scored_df.columns else False
+                score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key, is_article=is_art))
             score_placeholder.empty()
             score_df = pd.DataFrame(score_rows)
             # Separate AI Thoughts from score columns
