@@ -753,7 +753,7 @@ if uploaded_file:
         # Put original columns first, then appended metric columns at the end
         orig_cols = list(df.columns)
         metric_cols = ["Platform","Impressions","Engagement","Likes",
-                       "Retweets_Shares","Quotes","Bookmarks_Saves","Replies_Comments","Content","Error"]
+                       "Retweets_Shares","Quotes","Bookmarks_Saves","Replies_Comments","Content","Is_Article","Error"]
         final_cols = orig_cols + [c for c in metric_cols if c not in orig_cols]
         result_df = result_df[[c for c in final_cols if c in result_df.columns]]
 
