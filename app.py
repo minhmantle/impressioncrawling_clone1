@@ -355,6 +355,66 @@ uploaded_file = st.file_uploader(
     label_visibility="visible"
 )
 
+
+# ====================== SCORING FUNCTION (AI) ======================
+def score_content_ai(text: str, criteria: list, api_key: str) -> dict:
+    """AI scoring using Claude Haiku — understands semantics, no keywords needed."""
+    import json as _json
+    if not text or not str(text).strip() or str(text).strip().lower() in ("nan", "none", ""):
+        return {cr["name"]: 0.0 for cr in criteria}
+
+    criteria_block = "\n".join(
+        f'- "{cr["name"]}": score 0 to {cr["max_score"]} (weight={cr["weight"]}). '
+        f'Higher = better match. Be strict and fair.'
+        for cr in criteria
+    )
+    prompt = f"""You are a content quality evaluator. Score the following tweet content against each criterion.
+
+TWEET CONTENT:
+{text}
+
+SCORING CRITERIA (score each from 0 up to the stated max):
+{criteria_block}
+
+Reply with ONLY a JSON object, no explanation. Example format:
+{{"Criterion Name": 7.5, "Another Criterion": 3.0}}"""
+
+    try:
+        import urllib.request, urllib.error
+        payload = _json.dumps({
+            "model": "claude-haiku-4-5",
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01"
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = _json.loads(resp.read())
+        raw_text = data["content"][0]["text"].strip()
+        # Strip markdown fences if present
+        if raw_text.startswith("```"):
+            raw_text = raw_text.split("```")[1]
+            if raw_text.startswith("json"):
+                raw_text = raw_text[4:]
+        scores_raw = _json.loads(raw_text.strip())
+        # Map back and cap at max_score
+        result = {}
+        for cr in criteria:
+            val = float(scores_raw.get(cr["name"], 0.0))
+            result[cr["name"]] = round(min(max(val, 0.0), cr["max_score"]), 2)
+        return result
+    except Exception as e:
+        return {cr["name"]: 0.0 for cr in criteria}
+
+
 if uploaded_file:
     # ── Parse file — support multi-sheet Excel ──
     if uploaded_file.name.endswith(".csv"):
@@ -401,6 +461,69 @@ if uploaded_file:
         f'<p style="color:#4A7A5E;font-size:0.8rem;margin-top:-8px;">Preview: {preview_str}</p>',
         unsafe_allow_html=True
     )
+
+
+    # ── Scoring Criteria Setup (AI-powered) ──
+    st.markdown('<div class="section-label">🎯 Content Scoring Criteria</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+<div style="background:#FFFFFF;border:1px solid #D1EEE0;border-radius:10px;padding:14px 20px;margin-bottom:12px;">
+  <p style="color:#0A2818;font-size:0.88rem;font-weight:600;margin:0 0 4px;">AI-powered scoring — no keywords needed</p>
+  <p style="color:#4A7A5E;font-size:0.82rem;margin:0;line-height:1.6;">
+    Just describe what you want to evaluate (e.g. <em>"not AI-generated"</em>, <em>"shows actual effort"</em>,
+    <em>"clear call to action"</em>). Claude AI will read each tweet and score it intelligently.
+    Requires an Anthropic API key — enter it below.
+  </p>
+</div>
+""", unsafe_allow_html=True)
+
+    # API key input
+    anthropic_api_key = st.text_input(
+        "🔑 Anthropic API Key",
+        type="password",
+        placeholder="sk-ant-...",
+        help="Get your key at https://console.anthropic.com — charged per use (~$0.0003/post with Haiku)"
+    )
+
+    if "num_criteria" not in st.session_state:
+        st.session_state["num_criteria"] = 3
+
+    col_add, col_remove, _ = st.columns([1, 1, 4])
+    if col_add.button("➕ Add Criterion"):
+        st.session_state["num_criteria"] += 1
+    if col_remove.button("➖ Remove Last") and st.session_state["num_criteria"] > 1:
+        st.session_state["num_criteria"] -= 1
+
+    n = st.session_state["num_criteria"]
+
+    st.markdown("""
+<div style="display:grid;grid-template-columns:3fr 0.8fr 0.8fr;gap:8px;
+            padding:8px 12px;background:#F4FBF7;border-radius:8px;margin-bottom:4px;">
+  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Criterion Description</span>
+  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Weight</span>
+  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Max Score</span>
+</div>
+""", unsafe_allow_html=True)
+
+    criteria_list = []
+    default_criteria = [
+        ("Content is relevant to Mantle / web3 ecosystem", 1.0, 10),
+        ("Shows genuine effort — not AI-generated or lazy",  1.0, 10),
+        ("Has a clear call to action or community value",    0.8,  8),
+    ]
+
+    for i in range(n):
+        c1, c2, c3 = st.columns([3, 0.8, 0.8])
+        def_name   = default_criteria[i][0] if i < len(default_criteria) else f"Criterion {i+1}"
+        def_weight = default_criteria[i][1] if i < len(default_criteria) else 1.0
+        def_max    = default_criteria[i][2] if i < len(default_criteria) else 10
+
+        name   = c1.text_input("Description", value=def_name,   key=f"cr_name_{i}", label_visibility="collapsed",
+                                placeholder="Describe what to evaluate...")
+        weight = c2.number_input("Weight",     value=def_weight, key=f"cr_w_{i}",    label_visibility="collapsed", min_value=0.0, step=0.1)
+        max_sc = c3.number_input("Max",        value=def_max,    key=f"cr_max_{i}",  label_visibility="collapsed", min_value=1,   step=1)
+
+        criteria_list.append({"name": name, "weight": weight, "max_score": max_sc})
 
     st.markdown('<div class="section-label">🚀 Run Analysis</div>', unsafe_allow_html=True)
 
@@ -541,6 +664,30 @@ if uploaded_file:
         st.session_state["total"]     = total
         st.session_state["skipped"]   = skipped
 
+        # ── Auto-run AI scoring immediately after fetch ──
+        valid_criteria = [c for c in criteria_list if c["name"].strip()]
+        if valid_criteria and anthropic_api_key and "Content" in result_df.columns:
+            scored_df   = result_df.copy()
+            score_placeholder = st.empty()
+            score_placeholder.info("🤖 Running AI content scoring...")
+            score_rows = []
+            for idx_s, txt in enumerate(scored_df["Content"].fillna("")):
+                score_placeholder.info(f"🤖 AI scoring post {idx_s+1} / {len(scored_df)}...")
+                score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key))
+            score_placeholder.empty()
+            score_df   = pd.DataFrame(score_rows)
+            score_df.columns = [f"Score: {c}" for c in score_df.columns]
+            score_df["Total Score"] = score_df.sum(axis=1).round(2)
+            for col in score_df.columns:
+                scored_df[col] = score_df[col].values
+            max_possible = sum(c["max_score"] * c["weight"] for c in valid_criteria)
+            st.session_state["scored_df"]      = scored_df
+            st.session_state["max_possible"]   = max_possible
+            st.session_state["valid_criteria"] = valid_criteria
+            st.success("✅ AI scoring complete!")
+        elif valid_criteria and not anthropic_api_key:
+            st.warning("⚠️ Enter your Anthropic API key above to enable AI scoring.")
+
 # ── Display results from session state (persists after download clicks) ──
 if "result_df" in st.session_state:
     result_df = st.session_state["result_df"]
@@ -580,136 +727,14 @@ if "result_df" in st.session_state:
     st.dataframe(result_df, use_container_width=True)
 
 
-# ====================== CONTENT SCORING ======================
-st.markdown('<div class="section-label">🎯 Content Scoring</div>', unsafe_allow_html=True)
-
-st.markdown("""
-<div style="background:#FFFFFF;border:1px solid #D1EEE0;border-radius:10px;padding:16px 20px;margin-bottom:16px;">
-  <p style="color:#0A2818;font-size:0.88rem;margin:0 0 6px;font-weight:600;">How it works</p>
-  <p style="color:#4A7A5E;font-size:0.82rem;margin:0;line-height:1.6;">
-    Define your scoring criteria below. Each criterion is checked against the <strong>tweet content text</strong>
-    that was fetched. Set a <strong>weight</strong> (relative importance) and a <strong>max score</strong> for each.
-    The tool will score each post rule-based and append the results to your data.
-  </p>
-</div>
-""", unsafe_allow_html=True)
-
-# ── How many criteria ──
-if "num_criteria" not in st.session_state:
-    st.session_state["num_criteria"] = 3
-
-col_add, col_remove, _ = st.columns([1, 1, 4])
-if col_add.button("➕ Add Criterion"):
-    st.session_state["num_criteria"] += 1
-if col_remove.button("➖ Remove Last") and st.session_state["num_criteria"] > 1:
-    st.session_state["num_criteria"] -= 1
-
-n = st.session_state["num_criteria"]
-
-# ── Criteria header ──
-st.markdown("""
-<div style="display:grid;grid-template-columns:2fr 2fr 0.8fr 0.8fr;gap:8px;
-            padding:8px 12px;background:#F4FBF7;border-radius:8px;margin-bottom:4px;">
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Criterion Name</span>
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Keywords (comma-separated)</span>
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Weight</span>
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Max Score</span>
-</div>
-""", unsafe_allow_html=True)
-
-criteria_list = []
-default_criteria = [
-    ("Relevance",    "mantle,mnt,web3,blockchain,crypto",  1.0, 10),
-    ("Call to Action","follow,retweet,like,share,join,check", 0.8, 8),
-    ("Engagement Bait","giveaway,airdrop,win,free,claim",    0.6, 6),
-]
-
-for i in range(n):
-    c1, c2, c3, c4 = st.columns([2, 2, 0.8, 0.8])
-    def_name    = default_criteria[i][0] if i < len(default_criteria) else f"Criterion {i+1}"
-    def_kw      = default_criteria[i][1] if i < len(default_criteria) else ""
-    def_weight  = default_criteria[i][2] if i < len(default_criteria) else 1.0
-    def_max     = default_criteria[i][3] if i < len(default_criteria) else 10
-
-    name    = c1.text_input("Name",     value=def_name,   key=f"cr_name_{i}",   label_visibility="collapsed")
-    kw_raw  = c2.text_input("Keywords", value=def_kw,     key=f"cr_kw_{i}",     label_visibility="collapsed")
-    weight  = c3.number_input("Weight", value=def_weight, key=f"cr_w_{i}",      label_visibility="collapsed", min_value=0.0, step=0.1)
-    max_sc  = c4.number_input("Max",    value=def_max,    key=f"cr_max_{i}",    label_visibility="collapsed", min_value=1,   step=1)
-
-    keywords = [k.strip().lower() for k in kw_raw.split(",") if k.strip()]
-    criteria_list.append({"name": name, "keywords": keywords, "weight": weight, "max_score": max_sc})
-
-# ── Scoring logic ──
-def score_content(text: str, criteria: list) -> dict:
-    """Rule-based scoring: keyword presence + density per criterion."""
-    text_lower = str(text).lower()
-    words      = text_lower.split()
-    total_words = max(len(words), 1)
-    scores = {}
-
-    for cr in criteria:
-        if not cr["keywords"] or not cr["name"]:
-            scores[cr["name"]] = 0.0
-            continue
-
-        # Count keyword hits
-        hits = sum(1 for kw in cr["keywords"] if kw in text_lower)
-        # Density bonus: hits relative to content length (caps at 1.0)
-        density = min(hits / total_words * 20, 1.0)
-        # Base ratio: fraction of keywords matched
-        hit_ratio = hits / len(cr["keywords"])
-        # Combined score
-        raw = (hit_ratio * 0.7 + density * 0.3) * cr["max_score"] * cr["weight"]
-        # Cap at max_score
-        scores[cr["name"]] = round(min(raw, cr["max_score"]), 2)
-
-    return scores
-
-# ── Run scoring button ──
-if st.button("🎯 Run Content Scoring", type="primary"):
-    if "result_df" not in st.session_state:
-        st.warning("⚠️ Please fetch metrics first before running content scoring.")
-    else:
-        scored_df = st.session_state["result_df"].copy()
-
-        if "Content" not in scored_df.columns:
-            st.error("No 'Content' column found. Make sure you've fetched metrics for X/Twitter posts.")
-        else:
-            valid_criteria = [c for c in criteria_list if c["name"] and c["keywords"]]
-            if not valid_criteria:
-                st.warning("Please define at least one criterion with a name and keywords.")
-            else:
-                score_rows = []
-                for content in scored_df["Content"].fillna(""):
-                    score_rows.append(score_content(content, valid_criteria))
-
-                score_df = pd.DataFrame(score_rows)
-                # Rename columns to avoid clashes
-                score_df.columns = [f"Score: {c}" for c in score_df.columns]
-                # Total score (weighted sum already baked in)
-                score_df["Total Score"] = score_df.sum(axis=1).round(2)
-
-                # Max possible total for reference
-                max_possible = sum(c["max_score"] * c["weight"] for c in valid_criteria)
-
-                # Merge back
-                for col in score_df.columns:
-                    scored_df[col] = score_df[col].values
-
-                st.session_state["scored_df"]    = scored_df
-                st.session_state["max_possible"] = max_possible
-                st.session_state["valid_criteria"] = valid_criteria
-                st.success(f"✅ Scoring complete! Max possible total score: **{max_possible:.1f}**")
-
-# ── Display scored results ──
+# ====================== SCORED RESULTS ======================
 if "scored_df" in st.session_state:
-    scored_df    = st.session_state["scored_df"]
-    max_possible = st.session_state["max_possible"]
+    scored_df      = st.session_state["scored_df"]
+    max_possible   = st.session_state["max_possible"]
     valid_criteria = st.session_state.get("valid_criteria", [])
 
-    st.markdown('<div class="section-label">📋 Scored Results</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">🎯 Content Scoring Results</div>', unsafe_allow_html=True)
 
-    # Summary pills
     scored_x = scored_df[scored_df["Platform"] == "X/Twitter"]
     if "Total Score" in scored_df.columns and len(scored_x) > 0:
         avg_score = scored_x["Total Score"].mean()
@@ -724,18 +749,15 @@ if "scored_df" in st.session_state:
         </div>
         """, unsafe_allow_html=True)
 
-    # Criteria weight table
     with st.expander("📐 Scoring Criteria Summary", expanded=False):
         crit_summary = pd.DataFrame([{
-            "Criterion": c["name"],
-            "Keywords": ", ".join(c["keywords"]),
-            "Weight": c["weight"],
-            "Max Score": c["max_score"],
+            "Criterion":    c["name"],
+            "Weight":       c["weight"],
+            "Max Score":    c["max_score"],
             "Weighted Max": round(c["max_score"] * c["weight"], 2)
         } for c in valid_criteria])
         st.dataframe(crit_summary, use_container_width=True, hide_index=True)
 
-    # Download scored Excel
     output_scored = BytesIO()
     with pd.ExcelWriter(output_scored, engine="openpyxl") as writer:
         scored_df.to_excel(writer, index=False)
@@ -747,7 +769,7 @@ if "scored_df" in st.session_state:
 
     st.dataframe(scored_df, use_container_width=True)
 
-# ====================== FOOTER ======================
+# ====================== FOOTER =======================
 st.markdown("""
 <div style="margin-top:48px; padding-top:20px; border-top:1px solid #D1EEE0;
             display:flex; justify-content:space-between; align-items:center;
