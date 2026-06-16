@@ -444,14 +444,19 @@ SCORES: {{"criterion name exactly as written": score, ...}}"""
             data = _json.loads(resp.read())
         raw_text = data["content"][0]["text"].strip()
 
-        # Parse REASONING block
+        # Parse REASONING block — always extract something meaningful
         ai_thoughts = ""
         if "REASONING:" in raw_text:
             reasoning_part = raw_text.split("REASONING:")[-1]
-            if "SCORES:" in reasoning_part:
-                ai_thoughts = reasoning_part.split("SCORES:")[0].strip()
-            else:
-                ai_thoughts = reasoning_part.strip()
+            ai_thoughts = reasoning_part.split("SCORES:")[0].strip() if "SCORES:" in reasoning_part else reasoning_part.strip()
+        elif "SCORES:" in raw_text:
+            # No REASONING header but text before SCORES exists — use that
+            before_scores = raw_text.split("SCORES:")[0].strip()
+            if before_scores:
+                ai_thoughts = before_scores
+        # Final fallback: if still empty, use full raw response (capped)
+        if not ai_thoughts:
+            ai_thoughts = raw_text[:300].strip() or "AI returned no explanation for this score."
 
         # Parse SCORES: {...} block
         scores_raw = {}
@@ -481,8 +486,8 @@ SCORES: {{"criterion name exactly as written": score, ...}}"""
             result[cr["name"]] = round(min(max(val, 0.0), cr["max_score"]), 2)
         return result
 
-    except Exception:
-        result = {"AI Thoughts": ""}
+    except Exception as _e:
+        result = {"AI Thoughts": f"Scoring error — could not evaluate this post ({str(_e)[:120]}). All scores set to 0."}
         for cr in criteria:
             result[cr["name"]] = 0.0
         return result
