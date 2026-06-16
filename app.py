@@ -358,32 +358,49 @@ uploaded_file = st.file_uploader(
 
 # ====================== SCORING FUNCTION (AI) ======================
 def score_content_ai(text: str, criteria: list, api_key: str) -> dict:
-    """AI scoring using Claude Haiku — understands semantics, no keywords needed."""
+    """AI scoring using Claude — chain-of-thought reasoning before scoring."""
     import json as _json
     if not text or not str(text).strip() or str(text).strip().lower() in ("nan", "none", ""):
         return {cr["name"]: 0.0 for cr in criteria}
 
     criteria_block = "\n".join(
-        f'- "{cr["name"]}": score 0 to {cr["max_score"]} (weight={cr["weight"]}). '
-        f'Higher = better match. Be strict and fair.'
-        for cr in criteria
+        f'{i+1}. "{cr["name"]}" — max score: {cr["max_score"]}'
+        for i, cr in enumerate(criteria)
     )
-    prompt = f"""You are a content quality evaluator. Score the following tweet content against each criterion.
 
-TWEET CONTENT:
-{text}
+    prompt = f"""You are an expert content evaluator for Mantle, a leading Ethereum Layer 2 blockchain network.
 
-SCORING CRITERIA (score each from 0 up to the stated max):
+ABOUT MANTLE:
+- Mantle is an Ethereum L2 blockchain focused on scalability, low fees, and DeFi/Web3 ecosystem growth
+- MNT is the native token. Related topics: DeFi, NFTs, GameFi, Web3, crypto, blockchain, on-chain activity
+- "Relevant content" includes: discussing Mantle features, MNT utility, ecosystem projects, Web3 use cases, crypto/DeFi insights, personal on-chain experiences
+- Content does NOT need to explicitly mention "Mantle" or "MNT" to be relevant — discussing Web3, DeFi, L2, or crypto topics counts
+- "Not AI-generated" means: personal voice, specific details, opinions, imperfections, storytelling, genuine enthusiasm — NOT generic buzzwords, templated structure, or overly polished marketing speak
+
+TWEET TO EVALUATE:
+"{text}"
+
+SCORING CRITERIA:
 {criteria_block}
 
-Reply with ONLY a JSON object, no explanation. Example format:
-{{"Criterion Name": 7.5, "Another Criterion": 3.0}}"""
+INSTRUCTIONS:
+- Think carefully about each criterion before scoring
+- For "not AI-generated": look for personal voice, specific anecdotes, imperfections, genuine opinions — generic or overly structured text scores LOW
+- For relevance: any genuine Web3/crypto/DeFi discussion is relevant, even without mentioning Mantle directly
+- Be STRICT: a mediocre post should score 40-60% of max. Only truly excellent posts get 80-100%
+- A blank, spammy, or completely off-topic post scores 0
+
+First, briefly reason about the tweet (2-3 sentences), then output scores.
+
+Reply in this exact format:
+REASONING: [your analysis]
+SCORES: {{"criterion name exactly as written": score, ...}}"""
 
     try:
-        import urllib.request, urllib.error
+        import urllib.request
         payload = _json.dumps({
             "model": "claude-haiku-4-5",
-            "max_tokens": 256,
+            "max_tokens": 512,
             "messages": [{"role": "user", "content": prompt}]
         }).encode()
         req = urllib.request.Request(
@@ -396,22 +413,43 @@ Reply with ONLY a JSON object, no explanation. Example format:
             },
             method="POST"
         )
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             data = _json.loads(resp.read())
         raw_text = data["content"][0]["text"].strip()
-        # Strip markdown fences if present
-        if raw_text.startswith("```"):
-            raw_text = raw_text.split("```")[1]
-            if raw_text.startswith("json"):
-                raw_text = raw_text[4:]
-        scores_raw = _json.loads(raw_text.strip())
-        # Map back and cap at max_score
+
+        # Parse SCORES: {...} block
+        scores_raw = {}
+        if "SCORES:" in raw_text:
+            json_part = raw_text.split("SCORES:")[-1].strip()
+            # Strip markdown fences
+            if json_part.startswith("```"):
+                json_part = json_part.split("```")[1]
+                if json_part.startswith("json"):
+                    json_part = json_part[4:]
+            # Find the JSON object
+            start = json_part.find("{")
+            end   = json_part.rfind("}") + 1
+            if start != -1 and end > start:
+                scores_raw = _json.loads(json_part[start:end])
+
+        # Map back — try exact match first, then partial match
         result = {}
         for cr in criteria:
-            val = float(scores_raw.get(cr["name"], 0.0))
+            matched = None
+            # Exact match
+            if cr["name"] in scores_raw:
+                matched = scores_raw[cr["name"]]
+            else:
+                # Partial / case-insensitive match
+                for k, v in scores_raw.items():
+                    if k.lower().strip() in cr["name"].lower() or cr["name"].lower() in k.lower().strip():
+                        matched = v
+                        break
+            val = float(matched) if matched is not None else 0.0
             result[cr["name"]] = round(min(max(val, 0.0), cr["max_score"]), 2)
         return result
-    except Exception as e:
+
+    except Exception:
         return {cr["name"]: 0.0 for cr in criteria}
 
 
@@ -477,13 +515,26 @@ if uploaded_file:
 </div>
 """, unsafe_allow_html=True)
 
-    # API key input
-    anthropic_api_key = st.text_input(
-        "🔑 Anthropic API Key",
-        type="password",
-        placeholder="sk-ant-...",
-        help="Get your key at https://console.anthropic.com — charged per use (~$0.0003/post with Haiku)"
-    )
+    # API key — auto-load from Streamlit secrets, fallback to manual input
+    _secret_key = ""
+    try:
+        _secret_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+    except Exception:
+        pass
+
+    if _secret_key:
+        anthropic_api_key = _secret_key
+        st.markdown(
+            '<p style="color:#3DD68C;font-size:0.8rem;margin-top:-4px;">🔑 API key loaded from Streamlit Secrets</p>',
+            unsafe_allow_html=True
+        )
+    else:
+        anthropic_api_key = st.text_input(
+            "🔑 Anthropic API Key",
+            type="password",
+            placeholder="sk-ant-...",
+            help="Set ANTHROPIC_API_KEY in Streamlit Secrets to avoid entering this every time. Go to app Settings → Secrets."
+        )
 
     if "num_criteria" not in st.session_state:
         st.session_state["num_criteria"] = 3
