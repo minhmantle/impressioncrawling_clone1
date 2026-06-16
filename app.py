@@ -361,7 +361,10 @@ def score_content_ai(text: str, criteria: list, api_key: str) -> dict:
     """AI scoring using Claude — chain-of-thought reasoning before scoring."""
     import json as _json
     if not text or not str(text).strip() or str(text).strip().lower() in ("nan", "none", ""):
-        return {cr["name"]: 0.0 for cr in criteria}
+        result = {"AI Thoughts": "No content available — this post was skipped or could not be fetched (private account, deleted tweet, or non-X/Twitter link)."}
+        for cr in criteria:
+            result[cr["name"]] = 0.0
+        return result
 
     criteria_block = "\n".join(
         f'{i+1}. "{cr["name"]}" — max score: {cr["max_score"]}'
@@ -388,7 +391,7 @@ INSTRUCTIONS:
 - For "not AI-generated": look for personal voice, specific anecdotes, imperfections, genuine opinions — generic or overly structured text scores LOW
 - For relevance: any genuine Web3/crypto/DeFi discussion is relevant, even without mentioning Mantle directly
 - Be STRICT: a mediocre post should score 40-60% of max. Only truly excellent posts get 80-100%
-- A blank, spammy, or completely off-topic post scores 0
+- If you give 0 for any criterion, you MUST explain why in the REASONING section
 
 First, briefly reason about the tweet (2-3 sentences), then output scores.
 
