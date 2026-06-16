@@ -417,30 +417,35 @@ SCORES: {{"criterion name exactly as written": score, ...}}"""
             data = _json.loads(resp.read())
         raw_text = data["content"][0]["text"].strip()
 
+        # Parse REASONING block
+        ai_thoughts = ""
+        if "REASONING:" in raw_text:
+            reasoning_part = raw_text.split("REASONING:")[-1]
+            if "SCORES:" in reasoning_part:
+                ai_thoughts = reasoning_part.split("SCORES:")[0].strip()
+            else:
+                ai_thoughts = reasoning_part.strip()
+
         # Parse SCORES: {...} block
         scores_raw = {}
         if "SCORES:" in raw_text:
             json_part = raw_text.split("SCORES:")[-1].strip()
-            # Strip markdown fences
             if json_part.startswith("```"):
                 json_part = json_part.split("```")[1]
                 if json_part.startswith("json"):
                     json_part = json_part[4:]
-            # Find the JSON object
             start = json_part.find("{")
             end   = json_part.rfind("}") + 1
             if start != -1 and end > start:
                 scores_raw = _json.loads(json_part[start:end])
 
         # Map back — try exact match first, then partial match
-        result = {}
+        result = {"AI Thoughts": ai_thoughts}
         for cr in criteria:
             matched = None
-            # Exact match
             if cr["name"] in scores_raw:
                 matched = scores_raw[cr["name"]]
             else:
-                # Partial / case-insensitive match
                 for k, v in scores_raw.items():
                     if k.lower().strip() in cr["name"].lower() or cr["name"].lower() in k.lower().strip():
                         matched = v
@@ -450,7 +455,10 @@ SCORES: {{"criterion name exactly as written": score, ...}}"""
         return result
 
     except Exception:
-        return {cr["name"]: 0.0 for cr in criteria}
+        result = {"AI Thoughts": ""}
+        for cr in criteria:
+            result[cr["name"]] = 0.0
+        return result
 
 
 if uploaded_file:
@@ -731,15 +739,18 @@ if uploaded_file:
         if valid_criteria and anthropic_api_key and "Content" in result_df.columns:
             scored_df   = result_df.copy()
             score_placeholder = st.empty()
-            score_placeholder.info("🤖 Running AI content scoring...")
             score_rows = []
             for idx_s, txt in enumerate(scored_df["Content"].fillna("")):
                 score_placeholder.info(f"🤖 AI scoring post {idx_s+1} / {len(scored_df)}...")
                 score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key))
             score_placeholder.empty()
-            score_df   = pd.DataFrame(score_rows)
+            score_df = pd.DataFrame(score_rows)
+            # Separate AI Thoughts from score columns
+            ai_thoughts_col = score_df.pop("AI Thoughts") if "AI Thoughts" in score_df.columns else pd.Series([""] * len(score_df))
             score_df.columns = [f"Score: {c}" for c in score_df.columns]
             score_df["Total Score"] = score_df.sum(axis=1).round(2)
+            # Insert AI Thoughts BEFORE score columns
+            scored_df.insert(len(scored_df.columns), "AI Thoughts", ai_thoughts_col.values)
             for col in score_df.columns:
                 scored_df[col] = score_df[col].values
             max_possible = sum(c["max_score"] * c["weight"] for c in valid_criteria)
@@ -750,21 +761,27 @@ if uploaded_file:
         elif valid_criteria and not anthropic_api_key:
             st.warning("⚠️ Enter your Anthropic API key above to enable AI scoring.")
 
-# ── Display results from session state (persists after download clicks) ──
+# ── Display results — unified table (metrics + AI scoring merged) ──
 if "result_df" in st.session_state:
-    result_df = st.session_state["result_df"]
-    total     = st.session_state["total"]
-    skipped   = st.session_state["skipped"]
+    result_df      = st.session_state["result_df"]
+    total          = st.session_state["total"]
+    skipped        = st.session_state["skipped"]
+    # Use scored_df if available, otherwise plain result_df
+    display_df     = st.session_state.get("scored_df", result_df)
+    max_possible   = st.session_state.get("max_possible", None)
+    valid_criteria = st.session_state.get("valid_criteria", [])
+    has_scoring    = "scored_df" in st.session_state
 
     st.markdown('<div class="section-label">📊 Results</div>', unsafe_allow_html=True)
 
-    x_rows = result_df[result_df["Platform"] == "X/Twitter"]
+    # ── Stats pills ──
+    x_rows = display_df[display_df["Platform"] == "X/Twitter"]
     total_impressions = x_rows["Impressions"].replace("", 0).astype(float).sum()
     total_engagement  = x_rows["Engagement"].replace("", 0).astype(float).sum()
     total_likes       = x_rows["Likes"].replace("", 0).astype(float).sum()
     success_count     = len(x_rows[x_rows["Error"] == ""])
 
-    st.markdown(f"""
+    pills = f"""
     <div class="stat-row">
       <div class="stat-pill"><strong>{total}</strong>Total Rows</div>
       <div class="stat-pill"><strong>{total - skipped}</strong>Links Scanned</div>
@@ -772,64 +789,35 @@ if "result_df" in st.session_state:
       <div class="stat-pill"><strong>{success_count}</strong>Fetched OK</div>
       <div class="stat-pill"><strong>{int(total_impressions):,}</strong>Total Impressions</div>
       <div class="stat-pill"><strong>{int(total_engagement):,}</strong>Total Engagement</div>
-      <div class="stat-pill"><strong>{int(total_likes):,}</strong>Total Likes</div>
-    </div>
-    """, unsafe_allow_html=True)
+      <div class="stat-pill"><strong>{int(total_likes):,}</strong>Total Likes</div>"""
+    if has_scoring and max_possible and "Total Score" in display_df.columns and len(x_rows) > 0:
+        avg_score = x_rows["Total Score"].mean()
+        pills += f"""
+      <div class="stat-pill"><strong>{max_possible:.1f}</strong>Max Possible Score</div>
+      <div class="stat-pill"><strong>{avg_score:.1f}</strong>Avg Score (X posts)</div>"""
+    pills += "\n    </div>"
+    st.markdown(pills, unsafe_allow_html=True)
 
-    # ── Excel download (above table) ──
-    output = BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        result_df.to_excel(writer, index=False)
-    st.download_button(
-        "⬇️ Download Excel",
-        output.getvalue(),
-        f"mantle_metrics_{time.strftime('%Y%m%d_%H%M')}.xlsx"
-    )
+    # ── Scoring criteria summary (if scoring ran) ──
+    if has_scoring and valid_criteria:
+        with st.expander("📐 Scoring Criteria Summary", expanded=False):
+            crit_summary = pd.DataFrame([{
+                "Criterion":    c["name"],
+                "Weight":       c["weight"],
+                "Max Score":    c["max_score"],
+                "Weighted Max": round(c["max_score"] * c["weight"], 2)
+            } for c in valid_criteria])
+            st.dataframe(crit_summary, use_container_width=True, hide_index=True)
 
-    st.dataframe(result_df, use_container_width=True)
+    # ── Single download button ──
+    fname = f"mantle_{'scored' if has_scoring else 'metrics'}_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+    dl_out = BytesIO()
+    with pd.ExcelWriter(dl_out, engine="openpyxl") as writer:
+        display_df.to_excel(writer, index=False)
+    st.download_button("⬇️ Download Excel", dl_out.getvalue(), fname)
 
-
-# ====================== SCORED RESULTS ======================
-if "scored_df" in st.session_state:
-    scored_df      = st.session_state["scored_df"]
-    max_possible   = st.session_state["max_possible"]
-    valid_criteria = st.session_state.get("valid_criteria", [])
-
-    st.markdown('<div class="section-label">🎯 Content Scoring Results</div>', unsafe_allow_html=True)
-
-    scored_x = scored_df[scored_df["Platform"] == "X/Twitter"]
-    if "Total Score" in scored_df.columns and len(scored_x) > 0:
-        avg_score = scored_x["Total Score"].mean()
-        max_score_row = scored_x["Total Score"].max()
-        min_score_row = scored_x["Total Score"].min()
-        st.markdown(f"""
-        <div class="stat-row">
-          <div class="stat-pill"><strong>{max_possible:.1f}</strong>Max Possible Score</div>
-          <div class="stat-pill"><strong>{avg_score:.1f}</strong>Avg Score (X posts)</div>
-          <div class="stat-pill"><strong>{max_score_row:.1f}</strong>Highest Score</div>
-          <div class="stat-pill"><strong>{min_score_row:.1f}</strong>Lowest Score</div>
-        </div>
-        """, unsafe_allow_html=True)
-
-    with st.expander("📐 Scoring Criteria Summary", expanded=False):
-        crit_summary = pd.DataFrame([{
-            "Criterion":    c["name"],
-            "Weight":       c["weight"],
-            "Max Score":    c["max_score"],
-            "Weighted Max": round(c["max_score"] * c["weight"], 2)
-        } for c in valid_criteria])
-        st.dataframe(crit_summary, use_container_width=True, hide_index=True)
-
-    output_scored = BytesIO()
-    with pd.ExcelWriter(output_scored, engine="openpyxl") as writer:
-        scored_df.to_excel(writer, index=False)
-    st.download_button(
-        "⬇️ Download Scored Excel",
-        output_scored.getvalue(),
-        f"mantle_scored_{time.strftime('%Y%m%d_%H%M')}.xlsx"
-    )
-
-    st.dataframe(scored_df, use_container_width=True)
+    # ── Single unified table ──
+    st.dataframe(display_df, use_container_width=True)
 
 # ====================== FOOTER =======================
 st.markdown("""
