@@ -399,14 +399,6 @@ def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool =
         for i, cr in enumerate(criteria)
     )
 
-    # Fetch images if available
-    image_b64_list = []
-    if media_urls:
-        for murl in media_urls[:2]:   # max 2 images per post to control cost
-            b64 = fetch_image_b64(murl)
-            if b64:
-                image_b64_list.append(b64)
-
     # ── Pre-flight checks: detect special content cases ──
     text_clean   = str(text).strip()
     word_count   = len(text_clean.split())
@@ -432,7 +424,7 @@ def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool =
         )
     if has_images_flag:
         notes.append(
-            f"🖼️ {len(media_urls)} image(s) detected and sent to AI for visual evaluation."
+            f"🖼️ {len(media_urls)} image(s) attached to this post (not evaluated by AI — visual review recommended)."
         )
 
     # Truncated / article
@@ -451,12 +443,6 @@ def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool =
         "Do NOT give 0 just because the content is cut off."
     ) if is_article else ""
 
-    has_images    = len(image_b64_list) > 0
-    visual_note   = (
-        f"This post includes {len(image_b64_list)} image(s) attached below. "
-        "Evaluate BOTH the text content AND the visual design/banner quality."
-    ) if has_images else "No visual media available — evaluate text only."
-
     prompt = f"""You are an expert content evaluator for Mantle, a leading Ethereum Layer 2 blockchain network.
 
 ABOUT MANTLE:
@@ -470,7 +456,6 @@ CONTENT TO EVALUATE ({content_type}):
 "{text}"
 
 {article_note}
-{visual_note}
 
 SCORING CRITERIA:
 {criteria_block}
@@ -488,98 +473,96 @@ Reply in this exact format:
 REASONING: [your analysis]
 SCORES: {{"criterion name exactly as written": score, ...}}"""
 
-    try:
-        import urllib.request
-        # Build message content — text + optional images
-        msg_content = []
-        for b64 in image_b64_list:
-            msg_content.append({
-                "type": "image",
-                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
-            })
-        msg_content.append({"type": "text", "text": prompt})
+    import time as _time
+    import urllib.request, urllib.error
 
-        payload = _json.dumps({
-            "model": "claude-haiku-4-5",
-            "max_tokens": 600,
-            "messages": [{"role": "user", "content": msg_content}]
-        }).encode()
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01"
-            },
-            method="POST"
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = _json.loads(resp.read())
-        raw_text = data["content"][0]["text"].strip()
+    raw_text = ""
+    max_retries = 3
 
-        # Parse REASONING block — always extract something meaningful
-        ai_thoughts = ""
-        if "REASONING:" in raw_text:
-            reasoning_part = raw_text.split("REASONING:")[-1]
-            ai_thoughts = reasoning_part.split("SCORES:")[0].strip() if "SCORES:" in reasoning_part else reasoning_part.strip()
-        elif "SCORES:" in raw_text:
-            # No REASONING header but text before SCORES exists — use that
-            before_scores = raw_text.split("SCORES:")[0].strip()
-            if before_scores:
-                ai_thoughts = before_scores
-        # Final fallback: if still empty, use full raw response (capped)
-        if not ai_thoughts:
-            ai_thoughts = raw_text[:300].strip() or "AI returned no explanation for this score."
+    for attempt in range(max_retries):
+        try:
+            payload = _json.dumps({
+                "model": "claude-haiku-4-5",
+                "max_tokens": 600,
+                "messages": [{"role": "user", "content": prompt}]
+            }).encode()
+            req = urllib.request.Request(
+                "https://api.anthropic.com/v1/messages",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-api-key": api_key,
+                    "anthropic-version": "2023-06-01"
+                },
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                data = _json.loads(resp.read())
+            raw_text = data["content"][0]["text"].strip()
+            break  # success
 
-        # Prepend any preflight notes so user sees them first
-        if preflight_note:
-            ai_thoughts = preflight_note + "\n\n" + ai_thoughts
-
-        # Parse SCORES: {...} block
-        scores_raw = {}
-        if "SCORES:" in raw_text:
-            json_part = raw_text.split("SCORES:")[-1].strip()
-            if json_part.startswith("```"):
-                json_part = json_part.split("```")[1]
-                if json_part.startswith("json"):
-                    json_part = json_part[4:]
-            start = json_part.find("{")
-            end   = json_part.rfind("}") + 1
-            if start != -1 and end > start:
-                scores_raw = _json.loads(json_part[start:end])
-
-        # Map back — try exact match first, then partial match
-        result = {"AI Thoughts": ai_thoughts}
-        for cr in criteria:
-            matched = None
-            if cr["name"] in scores_raw:
-                matched = scores_raw[cr["name"]]
+        except urllib.error.HTTPError as _http_e:
+            if _http_e.code == 429:
+                # Rate limit — exponential backoff: 10s → 20s → 40s
+                wait = 10 * (2 ** attempt)
+                _time.sleep(wait)
+                if attempt == max_retries - 1:
+                    result = {"AI Thoughts": f"⚠️ Rate limit hit after {max_retries} retries — skipped. Try a smaller batch or wait a few minutes."}
+                    for cr in criteria:
+                        result[cr["name"]] = 0.0
+                    return result
+                continue
             else:
-                for k, v in scores_raw.items():
-                    if k.lower().strip() in cr["name"].lower() or cr["name"].lower() in k.lower().strip():
-                        matched = v
-                        break
-            val = float(matched) if matched is not None else 0.0
-            result[cr["name"]] = round(min(max(val, 0.0), cr["max_score"]), 2)
-        return result
+                result = {"AI Thoughts": f"⚠️ API error (HTTP {_http_e.code}) — could not score this post."}
+                for cr in criteria:
+                    result[cr["name"]] = 0.0
+                return result
+    # Parse REASONING block — always extract something meaningful
+    ai_thoughts = ""
+    if "REASONING:" in raw_text:
+        reasoning_part = raw_text.split("REASONING:")[-1]
+        ai_thoughts = reasoning_part.split("SCORES:")[0].strip() if "SCORES:" in reasoning_part else reasoning_part.strip()
+    elif "SCORES:" in raw_text:
+        before_scores = raw_text.split("SCORES:")[0].strip()
+        if before_scores:
+            ai_thoughts = before_scores
+    if not ai_thoughts:
+        ai_thoughts = raw_text[:300].strip() or "AI returned no explanation for this score."
+    if preflight_note:
+        ai_thoughts = preflight_note + "\n\n" + ai_thoughts
 
-    except Exception as _e:
-        result = {"AI Thoughts": f"Scoring error — could not evaluate this post ({str(_e)[:120]}). All scores set to 0."}
-        for cr in criteria:
-            result[cr["name"]] = 0.0
-        return result
+    # Parse SCORES: {...} block
+    scores_raw = {}
+    if "SCORES:" in raw_text:
+        json_part = raw_text.split("SCORES:")[-1].strip()
+        if json_part.startswith("```"):
+            json_part = json_part.split("```")[1]
+            if json_part.startswith("json"):
+                json_part = json_part[4:]
+        start = json_part.find("{")
+        end   = json_part.rfind("}") + 1
+        if start != -1 and end > start:
+            scores_raw = _json.loads(json_part[start:end])
+
+    # Map back — try exact match first, then partial match
+    result = {"AI Thoughts": ai_thoughts}
+    for cr in criteria:
+        matched = None
+        if cr["name"] in scores_raw:
+            matched = scores_raw[cr["name"]]
+        else:
+            for k, v in scores_raw.items():
+                if k.lower().strip() in cr["name"].lower() or cr["name"].lower() in k.lower().strip():
+                    matched = v
+                    break
+        val = float(matched) if matched is not None else 0.0
+        result[cr["name"]] = round(min(max(val, 0.0), cr["max_score"]), 2)
+    return result
 
 
-def fetch_image_b64(image_url: str) -> str:
-    """Fetch an image URL and return base64-encoded string."""
-    import urllib.request, base64
-    try:
-        req = urllib.request.Request(image_url, headers={"User-Agent": "Mantle-Squad-Tool/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return base64.b64encode(r.read()).decode()
-    except Exception:
-        return ""
+
+
+
 
 
 if uploaded_file:
@@ -881,7 +864,7 @@ if uploaded_file:
                 med_raw  = scored_df.get("Media_URLs",  pd.Series([""]*len(scored_df))).iloc[idx_s] if "Media_URLs" in scored_df.columns else ""
                 med_list = [u.strip() for u in str(med_raw).split(",") if u.strip() and u.strip() != "nan"]
                 score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key, is_article=is_art, media_urls=med_list))
-                time.sleep(2.0)  # Avoid rate limiting (429) from Claude API
+                time.sleep(2.0)  # Avoid rate limiting — retry logic handles 429 if hit
             score_placeholder.empty()
             score_df = pd.DataFrame(score_rows)
             # Separate AI Thoughts from score columns
