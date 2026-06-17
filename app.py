@@ -395,7 +395,7 @@ def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool =
         return result
 
     criteria_block = "\n".join(
-        f'{i+1}. "{cr["name"]}" — max score: {cr["max_score"]}'
+        f'{i+1}. "{cr["name"]}" — max score: {cr["max_score"]} (weight: {cr["weight"]}%)'
         for i, cr in enumerate(criteria)
     )
 
@@ -668,9 +668,9 @@ if uploaded_file:
     # ── Criteria stored as list in session_state for flexible add/remove/insert ──
     if "criteria_rows" not in st.session_state:
         st.session_state["criteria_rows"] = [
-            {"name": "Content is relevant to Mantle / web3 ecosystem", "weight": 1.0, "max_score": 10},
-            {"name": "Shows genuine effort — not AI-generated or lazy",  "weight": 1.0, "max_score": 10},
-            {"name": "Has a clear call to action or community value",    "weight": 0.8, "max_score":  8},
+            {"name": "Content is relevant to Mantle / web3 ecosystem", "weight": 40, "max_score": 10},
+            {"name": "Shows genuine effort — not AI-generated or lazy",  "weight": 40, "max_score": 10},
+            {"name": "Has a clear call to action or community value",    "weight": 20, "max_score":  8},
         ]
 
     rows = st.session_state["criteria_rows"]
@@ -682,13 +682,13 @@ if uploaded_file:
         if act == "delete" and len(rows) > 1:
             rows.pop(idx)
         elif act == "insert":
-            rows.insert(idx + 1, {"name": "", "weight": 1.0, "max_score": 10})
+            rows.insert(idx + 1, {"name": "", "weight": 0, "max_score": 10})
 
     st.markdown("""
 <div style="display:grid;grid-template-columns:3fr 0.8fr 0.8fr 0.5fr;gap:8px;
             padding:8px 12px;background:#F4FBF7;border-radius:8px;margin-bottom:4px;">
   <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Criterion Description</span>
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Weight</span>
+  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Weight (%)</span>
   <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Max Score</span>
   <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Actions</span>
 </div>
@@ -699,7 +699,7 @@ if uploaded_file:
         c1, c2, c3, c4 = st.columns([3, 0.8, 0.8, 0.5])
         name   = c1.text_input("Description", value=row["name"],       key=f"cr_name_{i}", label_visibility="collapsed",
                                 placeholder="Describe what to evaluate...")
-        weight = c2.number_input("Weight",     value=row["weight"],     key=f"cr_w_{i}",    label_visibility="collapsed", min_value=0.0, step=0.1)
+        weight = c2.number_input("Weight (%)", value=int(row["weight"]), key=f"cr_w_{i}",    label_visibility="collapsed", min_value=0,   max_value=100, step=1)
         max_sc = c3.number_input("Max",        value=row["max_score"],  key=f"cr_max_{i}",  label_visibility="collapsed", min_value=1,   step=1)
 
         # ── Inline action buttons ──
@@ -716,9 +716,21 @@ if uploaded_file:
         rows[i] = {"name": name, "weight": weight, "max_score": max_sc}
         criteria_list.append({"name": name, "weight": weight, "max_score": max_sc})
 
+    # ── Weight validation ──
+    total_weight = sum(c["weight"] for c in criteria_list if c["name"].strip())
+    weight_ok = total_weight == 100
+
     st.markdown('<div class="section-label">🚀 Run Analysis</div>', unsafe_allow_html=True)
 
-    if st.button("🚀 Fetch Metrics & Calculate Engagement", type="primary"):
+    if total_weight != 100:
+        diff = total_weight - 100
+        direction = f"+{diff}" if diff > 0 else str(diff)
+        st.warning(
+            f"⚠️ Weights must sum to **100%** — currently **{total_weight}%** ({direction}). "
+            f"Please adjust before fetching."
+        )
+
+    if st.button("🚀 Fetch Metrics & Calculate Engagement", type="primary", disabled=not weight_ok):
 
         # ── Sleep warning banner ──
         st.markdown('''
@@ -880,7 +892,7 @@ if uploaded_file:
             scored_df.insert(len(scored_df.columns), "AI Thoughts", ai_thoughts_col.values)
             for col in score_df.columns:
                 scored_df[col] = score_df[col].values
-            max_possible = sum(c["max_score"] * c["weight"] for c in valid_criteria)
+            max_possible = sum(c["max_score"] * (c["weight"] / 100) for c in valid_criteria)
             st.session_state["scored_df"]      = scored_df
             st.session_state["max_possible"]   = max_possible
             st.session_state["valid_criteria"] = valid_criteria
@@ -932,7 +944,7 @@ if "result_df" in st.session_state:
                 "Criterion":    c["name"],
                 "Weight":       c["weight"],
                 "Max Score":    c["max_score"],
-                "Weighted Max": round(c["max_score"] * c["weight"], 2)
+                "Weighted Max": round(c["max_score"] * (c["weight"] / 100), 2)
             } for c in valid_criteria])
             st.dataframe(crit_summary, use_container_width=True, hide_index=True)
 
