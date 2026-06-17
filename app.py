@@ -328,6 +328,19 @@ def fetch_x_metrics(tid):
             if tweet.get("article"):
                 article_body = str(tweet["article"].get("text") or tweet["article"].get("title") or "")[:1200]
             content_text = (article_body or raw_text)[:600]
+
+            # Extract media URLs (photos + video thumbnails)
+            media        = tweet.get("media") or {}
+            photos       = media.get("photos") or []
+            videos       = media.get("videos") or []
+            media_urls   = []
+            for p in photos:
+                url_p = p.get("url") or p.get("media_url_https") or ""
+                if url_p: media_urls.append(url_p)
+            for v in videos:
+                url_v = v.get("thumbnail_url") or v.get("preview_image_url") or ""
+                if url_v: media_urls.append(url_v)
+
             return {
                 "impressions": views,
                 "likes": likes,
@@ -338,16 +351,17 @@ def fetch_x_metrics(tid):
                 "engagement": engagement,
                 "content": content_text,
                 "is_article": is_article,
+                "media_urls": media_urls,
                 "error": ""
             }
         else:
             return {"impressions":0,"likes":0,"retweets":0,"quotes":0,
                     "bookmarks":0,"replies":0,"engagement":0,"content":"",
-                    "is_article":False,"error": f"HTTP {resp.status_code}"}
+                    "is_article":False,"media_urls":[],"error": f"HTTP {resp.status_code}"}
     except Exception as e:
         return {"impressions":0,"likes":0,"retweets":0,"quotes":0,
                 "bookmarks":0,"replies":0,"engagement":0,"content":"",
-                "is_article":False,"error": str(e)[:100]}
+                "is_article":False,"media_urls":[],"error": str(e)[:100]}
 
 # ====================== HEADER ======================
 st.markdown("""
@@ -371,7 +385,7 @@ uploaded_file = st.file_uploader(
 
 
 # ====================== SCORING FUNCTION (AI) ======================
-def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool = False) -> dict:
+def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool = False, media_urls: list = None) -> dict:
     """AI scoring using Claude — chain-of-thought reasoning before scoring."""
     import json as _json
     if not text or not str(text).strip() or str(text).strip().lower() in ("nan", "none", ""):
@@ -385,13 +399,63 @@ def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool =
         for i, cr in enumerate(criteria)
     )
 
-    content_type = "X Article (long-form — text below is truncated, full article not available)" if is_article else "Tweet"
+    # Fetch images if available
+    image_b64_list = []
+    if media_urls:
+        for murl in media_urls[:2]:   # max 2 images per post to control cost
+            b64 = fetch_image_b64(murl)
+            if b64:
+                image_b64_list.append(b64)
+
+    # ── Pre-flight checks: detect special content cases ──
+    text_clean   = str(text).strip()
+    word_count   = len(text_clean.split())
+    notes = []
+
+    # Too short to evaluate meaningfully
+    if word_count < 8:
+        notes.append(
+            f"⚠️ Very short content ({word_count} words) — insufficient basis for a full evaluation. "
+            "Scores may not be reliable."
+        )
+
+    # Video detection (AI can see images but not video content)
+    video_signals    = ["/video/", "youtu.be", "youtube.com", "vimeo.com"]
+    text_lower_check = text_clean.lower()
+    has_video_link   = any(s in text_lower_check for s in video_signals)
+    is_mostly_link   = word_count <= 5 and "https://" in text_clean
+    has_images_flag  = bool(media_urls)
+    if has_video_link or (is_mostly_link and not has_images_flag):
+        notes.append(
+            "⚠️ This post appears to contain a video. AI can only evaluate thumbnail/text — "
+            "consider manual review for actual video content quality."
+        )
+    if has_images_flag:
+        notes.append(
+            f"🖼️ {len(media_urls)} image(s) detected and sent to AI for visual evaluation."
+        )
+
+    # Truncated / article
+    if is_article:
+        notes.append(
+            "⚠️ This is an X Article — only a truncated preview is available. "
+            "AI scored based on partial content; full article was not accessible."
+        )
+
+    preflight_note = "  ".join(notes)  # will be prepended to AI Thoughts
+
+    content_type = "X Article (truncated preview)" if is_article else "Tweet"
     article_note = (
         "NOTE: This is an X Article. Only a truncated preview is available. "
-        "Score based on what you can read — acknowledge in your reasoning that this is partial content "
-        "and avoid penalizing for missing context you cannot see. "
+        "Score based on what you can read — do NOT penalize for missing context. "
         "Do NOT give 0 just because the content is cut off."
     ) if is_article else ""
+
+    has_images    = len(image_b64_list) > 0
+    visual_note   = (
+        f"This post includes {len(image_b64_list)} image(s) attached below. "
+        "Evaluate BOTH the text content AND the visual design/banner quality."
+    ) if has_images else "No visual media available — evaluate text only."
 
     prompt = f"""You are an expert content evaluator for Mantle, a leading Ethereum Layer 2 blockchain network.
 
@@ -406,6 +470,7 @@ CONTENT TO EVALUATE ({content_type}):
 "{text}"
 
 {article_note}
+{visual_note}
 
 SCORING CRITERIA:
 {criteria_block}
@@ -425,10 +490,19 @@ SCORES: {{"criterion name exactly as written": score, ...}}"""
 
     try:
         import urllib.request
+        # Build message content — text + optional images
+        msg_content = []
+        for b64 in image_b64_list:
+            msg_content.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": b64}
+            })
+        msg_content.append({"type": "text", "text": prompt})
+
         payload = _json.dumps({
             "model": "claude-haiku-4-5",
-            "max_tokens": 512,
-            "messages": [{"role": "user", "content": prompt}]
+            "max_tokens": 600,
+            "messages": [{"role": "user", "content": msg_content}]
         }).encode()
         req = urllib.request.Request(
             "https://api.anthropic.com/v1/messages",
@@ -457,6 +531,10 @@ SCORES: {{"criterion name exactly as written": score, ...}}"""
         # Final fallback: if still empty, use full raw response (capped)
         if not ai_thoughts:
             ai_thoughts = raw_text[:300].strip() or "AI returned no explanation for this score."
+
+        # Prepend any preflight notes so user sees them first
+        if preflight_note:
+            ai_thoughts = preflight_note + "\n\n" + ai_thoughts
 
         # Parse SCORES: {...} block
         scores_raw = {}
@@ -491,6 +569,17 @@ SCORES: {{"criterion name exactly as written": score, ...}}"""
         for cr in criteria:
             result[cr["name"]] = 0.0
         return result
+
+
+def fetch_image_b64(image_url: str) -> str:
+    """Fetch an image URL and return base64-encoded string."""
+    import urllib.request, base64
+    try:
+        req = urllib.request.Request(image_url, headers={"User-Agent": "Mantle-Squad-Tool/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return base64.b64encode(r.read()).decode()
+    except Exception:
+        return ""
 
 
 if uploaded_file:
@@ -715,6 +804,7 @@ if uploaded_file:
                                 "Engagement":       metrics["engagement"],
                                 "Content":          metrics["content"],
                                 "Is_Article":       metrics.get("is_article", False),
+                                "Media_URLs":       ", ".join(metrics.get("media_urls", [])),
                                 "Error":            metrics.get("error", "")
                             })
 
@@ -758,7 +848,7 @@ if uploaded_file:
         # Put original columns first, then appended metric columns at the end
         orig_cols = list(df.columns)
         metric_cols = ["Platform","Impressions","Engagement","Likes",
-                       "Retweets_Shares","Quotes","Bookmarks_Saves","Replies_Comments","Content","Is_Article","Error"]
+                       "Retweets_Shares","Quotes","Bookmarks_Saves","Replies_Comments","Content","Is_Article","Media_URLs","Error"]
         final_cols = orig_cols + [c for c in metric_cols if c not in orig_cols]
         result_df = result_df[[c for c in final_cols if c in result_df.columns]]
 
@@ -775,8 +865,11 @@ if uploaded_file:
             score_rows = []
             for idx_s, txt in enumerate(scored_df["Content"].fillna("")):
                 score_placeholder.info(f"🤖 AI scoring post {idx_s+1} / {len(scored_df)}...")
-                is_art = bool(scored_df.get("Is_Article", pd.Series([False]*len(scored_df))).iloc[idx_s]) if "Is_Article" in scored_df.columns else False
-                score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key, is_article=is_art))
+                is_art   = bool(scored_df.get("Is_Article",  pd.Series([False]*len(scored_df))).iloc[idx_s]) if "Is_Article"  in scored_df.columns else False
+                med_raw  = scored_df.get("Media_URLs",  pd.Series([""]*len(scored_df))).iloc[idx_s] if "Media_URLs" in scored_df.columns else ""
+                med_list = [u.strip() for u in str(med_raw).split(",") if u.strip() and u.strip() != "nan"]
+                score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key, is_article=is_art, media_urls=med_list))
+                time.sleep(2.0)  # Avoid rate limiting (429) from Claude API
             score_placeholder.empty()
             score_df = pd.DataFrame(score_rows)
             # Separate AI Thoughts from score columns
