@@ -3,5 +3,3 @@ pandas
 requests
 openpyxl
 yt-dlp
-tweepy>=4.14.0
-xlsxwriter>=3.1.0
