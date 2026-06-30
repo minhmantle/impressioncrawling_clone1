@@ -4,6 +4,7 @@ import re
 import requests
 import time
 import random
+import io
 from urllib.parse import urlparse
 from io import BytesIO
 
@@ -377,382 +378,445 @@ st.markdown("""
 # ====================== UPLOAD SECTION ======================
 st.markdown('<div class="section-label">📂 Upload Your File</div>', unsafe_allow_html=True)
 
-uploaded_file = st.file_uploader(
-    "Drag & drop or browse — CSV, Excel, or plain TXT (one link per line)",
-    type=["csv", "xlsx", "xls", "txt"],
-    label_visibility="visible"
-)
+# ====================== TABS ======================
+tab_metrics, tab_fake = st.tabs(["📊 Metrics Checker", "🔍 Fake Engagement Detector"])
 
-
-# ====================== SCORING FUNCTION (AI) ======================
-def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool = False, media_urls: list = None) -> dict:
-    """AI scoring using Claude — chain-of-thought reasoning before scoring."""
-    import json as _json
-    if not text or not str(text).strip() or str(text).strip().lower() in ("nan", "none", ""):
-        result = {"AI Thoughts": "No content available — this post was skipped or could not be fetched (private account, deleted tweet, or non-X/Twitter link)."}
-        for cr in criteria:
-            result[cr["name"]] = 0.0
-        return result
-
-    criteria_block = "\n".join(
-        f'{i+1}. "{cr["name"]}" — max score: {cr["max_score"]} (weight: {cr["weight"]}%)'
-        for i, cr in enumerate(criteria)
+with tab_metrics:
+    uploaded_file = st.file_uploader(
+        "Drag & drop or browse — CSV, Excel, or plain TXT (one link per line)",
+        type=["csv", "xlsx", "xls", "txt"],
+        label_visibility="visible"
     )
-
-    # ── Pre-flight checks: detect special content cases ──
-    text_clean   = str(text).strip()
-    word_count   = len(text_clean.split())
-    notes = []
-
-    # Too short to evaluate meaningfully
-    if word_count < 8:
-        notes.append(
-            f"⚠️ Very short content ({word_count} words) — insufficient basis for a full evaluation. "
-            "Scores may not be reliable."
+    
+    
+    # ====================== SCORING FUNCTION (AI) ======================
+    def score_content_ai(text: str, criteria: list, api_key: str, is_article: bool = False, media_urls: list = None) -> dict:
+        """AI scoring using Claude — chain-of-thought reasoning before scoring."""
+        import json as _json
+        if not text or not str(text).strip() or str(text).strip().lower() in ("nan", "none", ""):
+            result = {"AI Thoughts": "No content available — this post was skipped or could not be fetched (private account, deleted tweet, or non-X/Twitter link)."}
+            for cr in criteria:
+                result[cr["name"]] = 0.0
+            return result
+    
+        criteria_block = "\n".join(
+            f'{i+1}. "{cr["name"]}" — max score: {cr["max_score"]} (weight: {cr["weight"]}%)'
+            for i, cr in enumerate(criteria)
         )
-
-    # Video detection (AI can see images but not video content)
-    video_signals    = ["/video/", "youtu.be", "youtube.com", "vimeo.com"]
-    text_lower_check = text_clean.lower()
-    has_video_link   = any(s in text_lower_check for s in video_signals)
-    is_mostly_link   = word_count <= 5 and "https://" in text_clean
-    has_images_flag  = bool(media_urls)
-    if has_video_link or (is_mostly_link and not has_images_flag):
-        notes.append(
-            "⚠️ This post appears to contain a video. AI can only evaluate thumbnail/text — "
-            "consider manual review for actual video content quality."
-        )
-    if has_images_flag:
-        notes.append(
-            f"🖼️ {len(media_urls)} image(s) attached to this post (not evaluated by AI — visual review recommended)."
-        )
-
-    # Truncated / article
-    if is_article:
-        notes.append(
-            "⚠️ This is an X Article — only a truncated preview is available. "
-            "AI scored based on partial content; full article was not accessible."
-        )
-
-    preflight_note = "  ".join(notes)  # will be prepended to AI Thoughts
-
-    content_type = "X Article (truncated preview)" if is_article else "Tweet"
-    article_note = (
-        "NOTE: This is an X Article. Only a truncated preview is available. "
-        "Score based on what you can read — do NOT penalize for missing context. "
-        "Do NOT give 0 just because the content is cut off."
-    ) if is_article else ""
-
-    prompt = f"""You are an expert content evaluator for Mantle, a leading Ethereum Layer 2 blockchain network.
-
-ABOUT MANTLE:
-- Mantle is an Ethereum L2 blockchain focused on scalability, low fees, and DeFi/Web3 ecosystem growth
-- MNT is the native token. Related topics: DeFi, NFTs, GameFi, Web3, crypto, blockchain, on-chain activity
-- "Relevant content" includes: discussing Mantle features, MNT utility, ecosystem projects, Web3 use cases, crypto/DeFi insights, personal on-chain experiences
-- Content does NOT need to explicitly mention "Mantle" or "MNT" to be relevant — discussing Web3, DeFi, L2, or crypto topics counts
-- "Not AI-generated" means: personal voice, specific details, opinions, imperfections, storytelling, genuine enthusiasm — NOT generic buzzwords, templated structure, or overly polished marketing speak
-
-CONTENT TO EVALUATE ({content_type}):
-"{text}"
-
-{article_note}
-
-SCORING CRITERIA:
-{criteria_block}
-
-INSTRUCTIONS:
-- Think carefully about each criterion before scoring
-- For "not AI-generated": look for personal voice, specific anecdotes, imperfections, genuine opinions — generic or overly structured text scores LOW
-- For relevance: any genuine Web3/crypto/DeFi discussion is relevant, even without mentioning Mantle directly
-- Be STRICT: a mediocre post should score 40-60% of max. Only truly excellent posts get 80-100%
-- If you give 0 for any criterion, you MUST explain why in the REASONING section
-
-First, briefly reason about the tweet (2-3 sentences), then output scores.
-
-Reply in this exact format:
-REASONING: [your analysis]
-SCORES: {{"criterion name exactly as written": score, ...}}"""
-
-    import time as _time
-    import urllib.request, urllib.error
-
-    raw_text = ""
-    max_retries = 3
-
-    for attempt in range(max_retries):
-        try:
-            payload = _json.dumps({
-                "model": "claude-haiku-4-5",
-                "max_tokens": 600,
-                "messages": [{"role": "user", "content": prompt}]
-            }).encode()
-            req = urllib.request.Request(
-                "https://api.anthropic.com/v1/messages",
-                data=payload,
-                headers={
-                    "Content-Type": "application/json",
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01"
-                },
-                method="POST"
+    
+        # ── Pre-flight checks: detect special content cases ──
+        text_clean   = str(text).strip()
+        word_count   = len(text_clean.split())
+        notes = []
+    
+        # Too short to evaluate meaningfully
+        if word_count < 8:
+            notes.append(
+                f"⚠️ Very short content ({word_count} words) — insufficient basis for a full evaluation. "
+                "Scores may not be reliable."
             )
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = _json.loads(resp.read())
-            raw_text = data["content"][0]["text"].strip()
-            break  # success
-
-        except urllib.error.HTTPError as _http_e:
-            if _http_e.code == 429:
-                # Rate limit — exponential backoff: 10s → 20s → 40s
-                wait = 10 * (2 ** attempt)
-                _time.sleep(wait)
-                if attempt == max_retries - 1:
-                    result = {"AI Thoughts": f"⚠️ Rate limit hit after {max_retries} retries — skipped. Try a smaller batch or wait a few minutes."}
+    
+        # Video detection (AI can see images but not video content)
+        video_signals    = ["/video/", "youtu.be", "youtube.com", "vimeo.com"]
+        text_lower_check = text_clean.lower()
+        has_video_link   = any(s in text_lower_check for s in video_signals)
+        is_mostly_link   = word_count <= 5 and "https://" in text_clean
+        has_images_flag  = bool(media_urls)
+        if has_video_link or (is_mostly_link and not has_images_flag):
+            notes.append(
+                "⚠️ This post appears to contain a video. AI can only evaluate thumbnail/text — "
+                "consider manual review for actual video content quality."
+            )
+        if has_images_flag:
+            notes.append(
+                f"🖼️ {len(media_urls)} image(s) attached to this post (not evaluated by AI — visual review recommended)."
+            )
+    
+        # Truncated / article
+        if is_article:
+            notes.append(
+                "⚠️ This is an X Article — only a truncated preview is available. "
+                "AI scored based on partial content; full article was not accessible."
+            )
+    
+        preflight_note = "  ".join(notes)  # will be prepended to AI Thoughts
+    
+        content_type = "X Article (truncated preview)" if is_article else "Tweet"
+        article_note = (
+            "NOTE: This is an X Article. Only a truncated preview is available. "
+            "Score based on what you can read — do NOT penalize for missing context. "
+            "Do NOT give 0 just because the content is cut off."
+        ) if is_article else ""
+    
+        prompt = f"""You are an expert content evaluator for Mantle, a leading Ethereum Layer 2 blockchain network.
+    
+    ABOUT MANTLE:
+    - Mantle is an Ethereum L2 blockchain focused on scalability, low fees, and DeFi/Web3 ecosystem growth
+    - MNT is the native token. Related topics: DeFi, NFTs, GameFi, Web3, crypto, blockchain, on-chain activity
+    - "Relevant content" includes: discussing Mantle features, MNT utility, ecosystem projects, Web3 use cases, crypto/DeFi insights, personal on-chain experiences
+    - Content does NOT need to explicitly mention "Mantle" or "MNT" to be relevant — discussing Web3, DeFi, L2, or crypto topics counts
+    - "Not AI-generated" means: personal voice, specific details, opinions, imperfections, storytelling, genuine enthusiasm — NOT generic buzzwords, templated structure, or overly polished marketing speak
+    
+    CONTENT TO EVALUATE ({content_type}):
+    "{text}"
+    
+    {article_note}
+    
+    SCORING CRITERIA:
+    {criteria_block}
+    
+    INSTRUCTIONS:
+    - Think carefully about each criterion before scoring
+    - For "not AI-generated": look for personal voice, specific anecdotes, imperfections, genuine opinions — generic or overly structured text scores LOW
+    - For relevance: any genuine Web3/crypto/DeFi discussion is relevant, even without mentioning Mantle directly
+    - Be STRICT: a mediocre post should score 40-60% of max. Only truly excellent posts get 80-100%
+    - If you give 0 for any criterion, you MUST explain why in the REASONING section
+    
+    First, briefly reason about the tweet (2-3 sentences), then output scores.
+    
+    Reply in this exact format:
+    REASONING: [your analysis]
+    SCORES: {{"criterion name exactly as written": score, ...}}"""
+    
+        import time as _time
+        import urllib.request, urllib.error
+    
+        raw_text = ""
+        max_retries = 3
+    
+        for attempt in range(max_retries):
+            try:
+                payload = _json.dumps({
+                    "model": "claude-haiku-4-5",
+                    "max_tokens": 600,
+                    "messages": [{"role": "user", "content": prompt}]
+                }).encode()
+                req = urllib.request.Request(
+                    "https://api.anthropic.com/v1/messages",
+                    data=payload,
+                    headers={
+                        "Content-Type": "application/json",
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01"
+                    },
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = _json.loads(resp.read())
+                raw_text = data["content"][0]["text"].strip()
+                break  # success
+    
+            except urllib.error.HTTPError as _http_e:
+                if _http_e.code == 429:
+                    # Rate limit — exponential backoff: 10s → 20s → 40s
+                    wait = 10 * (2 ** attempt)
+                    _time.sleep(wait)
+                    if attempt == max_retries - 1:
+                        result = {"AI Thoughts": f"⚠️ Rate limit hit after {max_retries} retries — skipped. Try a smaller batch or wait a few minutes."}
+                        for cr in criteria:
+                            result[cr["name"]] = 0.0
+                        return result
+                    continue
+                else:
+                    result = {"AI Thoughts": f"⚠️ API error (HTTP {_http_e.code}) — could not score this post."}
                     for cr in criteria:
                         result[cr["name"]] = 0.0
                     return result
-                continue
+        # Parse REASONING block — always extract something meaningful
+        ai_thoughts = ""
+        if "REASONING:" in raw_text:
+            reasoning_part = raw_text.split("REASONING:")[-1]
+            ai_thoughts = reasoning_part.split("SCORES:")[0].strip() if "SCORES:" in reasoning_part else reasoning_part.strip()
+        elif "SCORES:" in raw_text:
+            before_scores = raw_text.split("SCORES:")[0].strip()
+            if before_scores:
+                ai_thoughts = before_scores
+        if not ai_thoughts:
+            ai_thoughts = raw_text[:300].strip() or "AI returned no explanation for this score."
+        if preflight_note:
+            ai_thoughts = preflight_note + "\n\n" + ai_thoughts
+    
+        # Parse SCORES: {...} block
+        scores_raw = {}
+        if "SCORES:" in raw_text:
+            json_part = raw_text.split("SCORES:")[-1].strip()
+            if json_part.startswith("```"):
+                json_part = json_part.split("```")[1]
+                if json_part.startswith("json"):
+                    json_part = json_part[4:]
+            start = json_part.find("{")
+            end   = json_part.rfind("}") + 1
+            if start != -1 and end > start:
+                scores_raw = _json.loads(json_part[start:end])
+    
+        # Map back — try exact match first, then partial match
+        result = {"AI Thoughts": ai_thoughts}
+        for cr in criteria:
+            matched = None
+            if cr["name"] in scores_raw:
+                matched = scores_raw[cr["name"]]
             else:
-                result = {"AI Thoughts": f"⚠️ API error (HTTP {_http_e.code}) — could not score this post."}
-                for cr in criteria:
-                    result[cr["name"]] = 0.0
-                return result
-    # Parse REASONING block — always extract something meaningful
-    ai_thoughts = ""
-    if "REASONING:" in raw_text:
-        reasoning_part = raw_text.split("REASONING:")[-1]
-        ai_thoughts = reasoning_part.split("SCORES:")[0].strip() if "SCORES:" in reasoning_part else reasoning_part.strip()
-    elif "SCORES:" in raw_text:
-        before_scores = raw_text.split("SCORES:")[0].strip()
-        if before_scores:
-            ai_thoughts = before_scores
-    if not ai_thoughts:
-        ai_thoughts = raw_text[:300].strip() or "AI returned no explanation for this score."
-    if preflight_note:
-        ai_thoughts = preflight_note + "\n\n" + ai_thoughts
-
-    # Parse SCORES: {...} block
-    scores_raw = {}
-    if "SCORES:" in raw_text:
-        json_part = raw_text.split("SCORES:")[-1].strip()
-        if json_part.startswith("```"):
-            json_part = json_part.split("```")[1]
-            if json_part.startswith("json"):
-                json_part = json_part[4:]
-        start = json_part.find("{")
-        end   = json_part.rfind("}") + 1
-        if start != -1 and end > start:
-            scores_raw = _json.loads(json_part[start:end])
-
-    # Map back — try exact match first, then partial match
-    result = {"AI Thoughts": ai_thoughts}
-    for cr in criteria:
-        matched = None
-        if cr["name"] in scores_raw:
-            matched = scores_raw[cr["name"]]
-        else:
-            for k, v in scores_raw.items():
-                if k.lower().strip() in cr["name"].lower() or cr["name"].lower() in k.lower().strip():
-                    matched = v
-                    break
-        val = float(matched) if matched is not None else 0.0
-        result[cr["name"]] = round(min(max(val, 0.0), cr["max_score"]), 2)
-    return result
-
-
-
-
-
-
-
-if uploaded_file:
-    # ── Parse file — support multi-sheet Excel ──
-    if uploaded_file.name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-        sheet_names = None
-    elif uploaded_file.name.endswith((".xlsx", ".xls")):
-        xls = pd.ExcelFile(uploaded_file)
-        sheet_names = xls.sheet_names
-        if len(sheet_names) > 1:
-            st.markdown('<div class="section-label">📑 Select Sheet</div>', unsafe_allow_html=True)
-            selected_sheet = st.selectbox(
-                "This file has multiple sheets — which one do you want to scan?",
-                sheet_names,
-                index=0
+                for k, v in scores_raw.items():
+                    if k.lower().strip() in cr["name"].lower() or cr["name"].lower() in k.lower().strip():
+                        matched = v
+                        break
+            val = float(matched) if matched is not None else 0.0
+            result[cr["name"]] = round(min(max(val, 0.0), cr["max_score"]), 2)
+        return result
+    
+    
+    
+    
+    
+    
+    
+    if uploaded_file:
+        # ── Parse file — support multi-sheet Excel ──
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+            sheet_names = None
+        elif uploaded_file.name.endswith((".xlsx", ".xls")):
+            xls = pd.ExcelFile(uploaded_file)
+            sheet_names = xls.sheet_names
+            if len(sheet_names) > 1:
+                st.markdown('<div class="section-label">📑 Select Sheet</div>', unsafe_allow_html=True)
+                selected_sheet = st.selectbox(
+                    "This file has multiple sheets — which one do you want to scan?",
+                    sheet_names,
+                    index=0
+                )
+            else:
+                selected_sheet = sheet_names[0]
+            df = pd.read_excel(xls, sheet_name=selected_sheet)
+            st.markdown(
+                f'<p style="color:#4A7A5E;font-size:0.8rem;margin-top:-4px;">📄 Sheet: <strong>{selected_sheet}</strong> &nbsp;·&nbsp; {len(sheet_names)} sheet(s) total</p>',
+                unsafe_allow_html=True
             )
         else:
-            selected_sheet = sheet_names[0]
-        df = pd.read_excel(xls, sheet_name=selected_sheet)
+            lines = [l.strip() for l in uploaded_file.getvalue().decode("utf-8").splitlines() if l.strip()]
+            df = pd.DataFrame({"Link": lines})
+            sheet_names = None
+    
+        st.success(f"✅ Loaded **{len(df)} rows** from `{uploaded_file.name}`")
+    
+        # ── Column selector ──
+        st.markdown('<div class="section-label">⚙️ Select Link Column</div>', unsafe_allow_html=True)
+        col_options = list(df.columns)
+        link_col = st.selectbox(
+            "Which column contains the post links?",
+            col_options,
+            index=0,
+            help="Select the column header that contains your post URLs"
+        )
+    
+        # Preview first few values of selected column
+        preview_vals = df[link_col].dropna().astype(str).head(3).tolist()
+        preview_str = " &nbsp;·&nbsp; ".join([v[:50] + ("…" if len(v) > 50 else "") for v in preview_vals])
         st.markdown(
-            f'<p style="color:#4A7A5E;font-size:0.8rem;margin-top:-4px;">📄 Sheet: <strong>{selected_sheet}</strong> &nbsp;·&nbsp; {len(sheet_names)} sheet(s) total</p>',
+            f'<p style="color:#4A7A5E;font-size:0.8rem;margin-top:-8px;">Preview: {preview_str}</p>',
             unsafe_allow_html=True
         )
-    else:
-        lines = [l.strip() for l in uploaded_file.getvalue().decode("utf-8").splitlines() if l.strip()]
-        df = pd.DataFrame({"Link": lines})
-        sheet_names = None
-
-    st.success(f"✅ Loaded **{len(df)} rows** from `{uploaded_file.name}`")
-
-    # ── Column selector ──
-    st.markdown('<div class="section-label">⚙️ Select Link Column</div>', unsafe_allow_html=True)
-    col_options = list(df.columns)
-    link_col = st.selectbox(
-        "Which column contains the post links?",
-        col_options,
-        index=0,
-        help="Select the column header that contains your post URLs"
-    )
-
-    # Preview first few values of selected column
-    preview_vals = df[link_col].dropna().astype(str).head(3).tolist()
-    preview_str = " &nbsp;·&nbsp; ".join([v[:50] + ("…" if len(v) > 50 else "") for v in preview_vals])
-    st.markdown(
-        f'<p style="color:#4A7A5E;font-size:0.8rem;margin-top:-8px;">Preview: {preview_str}</p>',
-        unsafe_allow_html=True
-    )
-
-
-    # ── Scoring Criteria Setup (AI-powered) ──
-    st.markdown('<div class="section-label">🎯 Content Scoring Criteria</div>', unsafe_allow_html=True)
-
-    st.markdown("""
-<div style="background:#FFFFFF;border:1px solid #D1EEE0;border-radius:10px;padding:14px 20px;margin-bottom:12px;">
-  <p style="color:#0A2818;font-size:0.88rem;font-weight:600;margin:0 0 4px;">AI-powered scoring — no keywords needed</p>
-  <p style="color:#4A7A5E;font-size:0.82rem;margin:0;line-height:1.6;">
-    Just describe what you want to evaluate (e.g. <em>"not AI-generated"</em>, <em>"shows actual effort"</em>,
-    <em>"clear call to action"</em>). Claude AI will read each tweet and score it intelligently.
-    Requires an Anthropic API key — enter it below.
-  </p>
-</div>
-""", unsafe_allow_html=True)
-
-    # API key — auto-load from Streamlit secrets, fallback to manual input
-    _secret_key = ""
-    try:
-        _secret_key = st.secrets.get("ANTHROPIC_API_KEY", "")
-    except Exception:
-        pass
-
-    if _secret_key:
-        anthropic_api_key = _secret_key
-        st.markdown(
-            '<p style="color:#3DD68C;font-size:0.8rem;margin-top:-4px;">🔑 API key loaded from Streamlit Secrets</p>',
-            unsafe_allow_html=True
-        )
-    else:
-        anthropic_api_key = st.text_input(
-            "🔑 Anthropic API Key",
-            type="password",
-            placeholder="sk-ant-...",
-            help="Set ANTHROPIC_API_KEY in Streamlit Secrets to avoid entering this every time. Go to app Settings → Secrets."
-        )
-
-    # ── Criteria stored as list in session_state for flexible add/remove/insert ──
-    if "criteria_rows" not in st.session_state:
-        st.session_state["criteria_rows"] = [
-            {"name": "Content is relevant to Mantle / web3 ecosystem", "weight": 40, "max_score": 10},
-            {"name": "Shows genuine effort — not AI-generated or lazy",  "weight": 40, "max_score": 10},
-            {"name": "Has a clear call to action or community value",    "weight": 20, "max_score":  8},
-        ]
-
-    rows = st.session_state["criteria_rows"]
-
-    # Handle add/remove/insert actions triggered from previous render
-    action = st.session_state.pop("cr_action", None)
-    if action:
-        act, idx = action
-        if act == "delete" and len(rows) > 1:
-            rows.pop(idx)
-        elif act == "insert":
-            rows.insert(idx + 1, {"name": "", "weight": 0, "max_score": 10})
-
-    st.markdown("""
-<div style="display:grid;grid-template-columns:3fr 0.8fr 0.8fr 0.5fr;gap:8px;
-            padding:8px 12px;background:#F4FBF7;border-radius:8px;margin-bottom:4px;">
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Criterion Description</span>
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Weight (%)</span>
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Max Score</span>
-  <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Actions</span>
-</div>
-""", unsafe_allow_html=True)
-
-    criteria_list = []
-    for i, row in enumerate(rows):
-        c1, c2, c3, c4 = st.columns([3, 0.8, 0.8, 0.5])
-        name   = c1.text_input("Description", value=row["name"],       key=f"cr_name_{i}", label_visibility="collapsed",
-                                placeholder="Describe what to evaluate...")
-        weight = c2.number_input("Weight (%)", value=int(row["weight"]), key=f"cr_w_{i}",    label_visibility="collapsed", min_value=0,   max_value=100, step=1)
-        max_sc = c3.number_input("Max",        value=row["max_score"],  key=f"cr_max_{i}",  label_visibility="collapsed", min_value=1,   step=1)
-
-        # ── Inline action buttons ──
-        btn_col1, btn_col2 = c4.columns(2)
-        if btn_col1.button("＋", key=f"cr_add_{i}", help="Insert new criterion below"):
-            st.session_state["cr_action"] = ("insert", i)
-            st.rerun()
-        if btn_col2.button("✕", key=f"cr_del_{i}", help="Remove this criterion",
-                           disabled=(len(rows) <= 1)):
-            st.session_state["cr_action"] = ("delete", i)
-            st.rerun()
-
-        # Persist current values back into session state
-        rows[i] = {"name": name, "weight": weight, "max_score": max_sc}
-        criteria_list.append({"name": name, "weight": weight, "max_score": max_sc})
-
-    # ── Weight validation ──
-    total_weight = sum(c["weight"] for c in criteria_list if c["name"].strip())
-    weight_ok = total_weight == 100
-
-    st.markdown('<div class="section-label">🚀 Run Analysis</div>', unsafe_allow_html=True)
-
-    if total_weight != 100:
-        diff = total_weight - 100
-        direction = f"+{diff}" if diff > 0 else str(diff)
-        st.warning(
-            f"⚠️ Weights must sum to **100%** — currently **{total_weight}%** ({direction}). "
-            f"Please adjust before fetching."
-        )
-
-    if st.button("🚀 Fetch Metrics & Calculate Engagement", type="primary", disabled=not weight_ok):
-
-        # ── Sleep warning banner ──
-        st.markdown('''
-        <div style="background:#FFF3CD;border:2px solid #F0A500;border-radius:10px;
-                    padding:14px 20px;margin-bottom:12px;display:flex;align-items:center;gap:12px;">
-          <span style="font-size:1.5rem;">⚠️</span>
-          <div>
-            <strong style="color:#7A4F00;font-size:0.95rem;">Keep your computer awake!</strong>
-            <p style="color:#7A4F00;font-size:0.85rem;margin:2px 0 0;">
-              Do not let your screen sleep or switch tabs while fetching — 
-              the task will stop and you'll have to start over from scratch.
-            </p>
-          </div>
-        </div>
-        ''', unsafe_allow_html=True)
-
-        # Show a random funny message
-        joke = random.choice(FUNNY_MESSAGES)
-        joke_placeholder = st.empty()
-        joke_placeholder.markdown(f'<div class="loading-joke">{joke}</div>', unsafe_allow_html=True)
-
-        with st.spinner("Fetching metrics — hang tight..."):
-            results = []
-            skipped = 0
-            progress_bar = st.progress(0)
-            status_text  = st.empty()
-
-            all_links = df[link_col].astype(str).tolist()
-            total = len(all_links)
-
-            for idx, raw_link in enumerate(all_links):
-                try:
-                    link = str(raw_link).strip()
-
-                    orig_row = df.iloc[idx].to_dict()
-
-                    # ── Skip invalid / non-URL cells ──
-                    if not link or link.lower() in ("nan", "none", "") or not link.startswith("http"):
+    
+    
+        # ── Scoring Criteria Setup (AI-powered) ──
+        st.markdown('<div class="section-label">🎯 Content Scoring Criteria</div>', unsafe_allow_html=True)
+    
+        st.markdown("""
+    <div style="background:#FFFFFF;border:1px solid #D1EEE0;border-radius:10px;padding:14px 20px;margin-bottom:12px;">
+      <p style="color:#0A2818;font-size:0.88rem;font-weight:600;margin:0 0 4px;">AI-powered scoring — no keywords needed</p>
+      <p style="color:#4A7A5E;font-size:0.82rem;margin:0;line-height:1.6;">
+        Just describe what you want to evaluate (e.g. <em>"not AI-generated"</em>, <em>"shows actual effort"</em>,
+        <em>"clear call to action"</em>). Claude AI will read each tweet and score it intelligently.
+        Requires an Anthropic API key — enter it below.
+      </p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+        # API key — auto-load from Streamlit secrets, fallback to manual input
+        _secret_key = ""
+        try:
+            _secret_key = st.secrets.get("ANTHROPIC_API_KEY", "")
+        except Exception:
+            pass
+    
+        if _secret_key:
+            anthropic_api_key = _secret_key
+            st.markdown(
+                '<p style="color:#3DD68C;font-size:0.8rem;margin-top:-4px;">🔑 API key loaded from Streamlit Secrets</p>',
+                unsafe_allow_html=True
+            )
+        else:
+            anthropic_api_key = st.text_input(
+                "🔑 Anthropic API Key",
+                type="password",
+                placeholder="sk-ant-...",
+                help="Set ANTHROPIC_API_KEY in Streamlit Secrets to avoid entering this every time. Go to app Settings → Secrets."
+            )
+    
+        # ── Criteria stored as list in session_state for flexible add/remove/insert ──
+        if "criteria_rows" not in st.session_state:
+            st.session_state["criteria_rows"] = [
+                {"name": "Content is relevant to Mantle / web3 ecosystem", "weight": 40, "max_score": 10},
+                {"name": "Shows genuine effort — not AI-generated or lazy",  "weight": 40, "max_score": 10},
+                {"name": "Has a clear call to action or community value",    "weight": 20, "max_score":  8},
+            ]
+    
+        rows = st.session_state["criteria_rows"]
+    
+        # Handle add/remove/insert actions triggered from previous render
+        action = st.session_state.pop("cr_action", None)
+        if action:
+            act, idx = action
+            if act == "delete" and len(rows) > 1:
+                rows.pop(idx)
+            elif act == "insert":
+                rows.insert(idx + 1, {"name": "", "weight": 0, "max_score": 10})
+    
+        st.markdown("""
+    <div style="display:grid;grid-template-columns:3fr 0.8fr 0.8fr 0.5fr;gap:8px;
+                padding:8px 12px;background:#F4FBF7;border-radius:8px;margin-bottom:4px;">
+      <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Criterion Description</span>
+      <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Weight (%)</span>
+      <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Max Score</span>
+      <span style="font-size:0.75rem;font-weight:700;color:#4A7A5E;text-transform:uppercase;letter-spacing:0.06em;">Actions</span>
+    </div>
+    """, unsafe_allow_html=True)
+    
+        criteria_list = []
+        for i, row in enumerate(rows):
+            c1, c2, c3, c4 = st.columns([3, 0.8, 0.8, 0.5])
+            name   = c1.text_input("Description", value=row["name"],       key=f"cr_name_{i}", label_visibility="collapsed",
+                                    placeholder="Describe what to evaluate...")
+            weight = c2.number_input("Weight (%)", value=int(row["weight"]), key=f"cr_w_{i}",    label_visibility="collapsed", min_value=0,   max_value=100, step=1)
+            max_sc = c3.number_input("Max",        value=row["max_score"],  key=f"cr_max_{i}",  label_visibility="collapsed", min_value=1,   step=1)
+    
+            # ── Inline action buttons ──
+            btn_col1, btn_col2 = c4.columns(2)
+            if btn_col1.button("＋", key=f"cr_add_{i}", help="Insert new criterion below"):
+                st.session_state["cr_action"] = ("insert", i)
+                st.rerun()
+            if btn_col2.button("✕", key=f"cr_del_{i}", help="Remove this criterion",
+                               disabled=(len(rows) <= 1)):
+                st.session_state["cr_action"] = ("delete", i)
+                st.rerun()
+    
+            # Persist current values back into session state
+            rows[i] = {"name": name, "weight": weight, "max_score": max_sc}
+            criteria_list.append({"name": name, "weight": weight, "max_score": max_sc})
+    
+        # ── Weight validation ──
+        total_weight = sum(c["weight"] for c in criteria_list if c["name"].strip())
+        weight_ok = total_weight == 100
+    
+        st.markdown('<div class="section-label">🚀 Run Analysis</div>', unsafe_allow_html=True)
+    
+        if total_weight != 100:
+            diff = total_weight - 100
+            direction = f"+{diff}" if diff > 0 else str(diff)
+            st.warning(
+                f"⚠️ Weights must sum to **100%** — currently **{total_weight}%** ({direction}). "
+                f"Please adjust before fetching."
+            )
+    
+        if st.button("🚀 Fetch Metrics & Calculate Engagement", type="primary", disabled=not weight_ok):
+    
+            # ── Sleep warning banner ──
+            st.markdown('''
+            <div style="background:#FFF3CD;border:2px solid #F0A500;border-radius:10px;
+                        padding:14px 20px;margin-bottom:12px;display:flex;align-items:center;gap:12px;">
+              <span style="font-size:1.5rem;">⚠️</span>
+              <div>
+                <strong style="color:#7A4F00;font-size:0.95rem;">Keep your computer awake!</strong>
+                <p style="color:#7A4F00;font-size:0.85rem;margin:2px 0 0;">
+                  Do not let your screen sleep or switch tabs while fetching — 
+                  the task will stop and you'll have to start over from scratch.
+                </p>
+              </div>
+            </div>
+            ''', unsafe_allow_html=True)
+    
+            # Show a random funny message
+            joke = random.choice(FUNNY_MESSAGES)
+            joke_placeholder = st.empty()
+            joke_placeholder.markdown(f'<div class="loading-joke">{joke}</div>', unsafe_allow_html=True)
+    
+            with st.spinner("Fetching metrics — hang tight..."):
+                results = []
+                skipped = 0
+                progress_bar = st.progress(0)
+                status_text  = st.empty()
+    
+                all_links = df[link_col].astype(str).tolist()
+                total = len(all_links)
+    
+                for idx, raw_link in enumerate(all_links):
+                    try:
+                        link = str(raw_link).strip()
+    
+                        orig_row = df.iloc[idx].to_dict()
+    
+                        # ── Skip invalid / non-URL cells ──
+                        if not link or link.lower() in ("nan", "none", "") or not link.startswith("http"):
+                            skipped += 1
+                            orig_row["Platform"]        = "Skipped"
+                            orig_row["Impressions"]      = ""
+                            orig_row["Engagement"]       = ""
+                            orig_row["Likes"]            = ""
+                            orig_row["Retweets_Shares"]  = ""
+                            orig_row["Quotes"]           = ""
+                            orig_row["Bookmarks_Saves"]  = ""
+                            orig_row["Replies_Comments"] = ""
+                            orig_row["Content"]          = ""
+                            orig_row["Error"]            = "Skipped — not a valid URL"
+                            results.append(orig_row)
+                            progress_bar.progress(min(100, int((idx + 1) / total * 100)))
+                            continue
+    
+                        platform = get_platform(link)
+                        status_text.markdown(
+                            f'<p style="color:#4A7A5E;font-size:0.82rem;font-weight:500;">'
+                            f'Processing {idx+1} / {total} &nbsp;·&nbsp; {link[:60]}{"…" if len(link)>60 else ""}</p>',
+                            unsafe_allow_html=True
+                        )
+    
+                        orig_row["Platform"]        = platform
+                        orig_row["Impressions"]      = 0
+                        orig_row["Engagement"]       = 0
+                        orig_row["Likes"]            = 0
+                        orig_row["Retweets_Shares"]  = 0
+                        orig_row["Quotes"]           = 0
+                        orig_row["Bookmarks_Saves"]  = 0
+                        orig_row["Replies_Comments"] = 0
+                        orig_row["Content"]          = ""
+                        orig_row["Error"]            = ""
+    
+                        if platform == "X/Twitter":
+                            tid = extract_tweet_id(link)
+                            if tid:
+                                metrics = fetch_x_metrics(tid)
+                                orig_row.update({
+                                    "Impressions":      metrics["impressions"],
+                                    "Likes":            metrics["likes"],
+                                    "Retweets_Shares":  metrics["retweets"],
+                                    "Quotes":           metrics["quotes"],
+                                    "Bookmarks_Saves":  metrics["bookmarks"],
+                                    "Replies_Comments": metrics["replies"],
+                                    "Engagement":       metrics["engagement"],
+                                    "Content":          metrics["content"],
+                                    "Is_Article":       metrics.get("is_article", False),
+                                    "Media_URLs":       ", ".join(metrics.get("media_urls", [])),
+                                    "Error":            metrics.get("error", "")
+                                })
+    
+                        results.append(orig_row)
+    
+                    except Exception as e:
+                        # Any unexpected error → skip this row silently
                         skipped += 1
+                        try:
+                            orig_row = df.iloc[idx].to_dict()
+                        except Exception:
+                            orig_row = {}
                         orig_row["Platform"]        = "Skipped"
                         orig_row["Impressions"]      = ""
                         orig_row["Engagement"]       = ""
@@ -762,192 +826,358 @@ if uploaded_file:
                         orig_row["Bookmarks_Saves"]  = ""
                         orig_row["Replies_Comments"] = ""
                         orig_row["Content"]          = ""
-                        orig_row["Error"]            = "Skipped — not a valid URL"
+                        orig_row["Error"]            = f"Skipped — {str(e)[:80]}"
                         results.append(orig_row)
-                        progress_bar.progress(min(100, int((idx + 1) / total * 100)))
-                        continue
+    
+                    progress_bar.progress(min(100, int((idx + 1) / total * 100)))
+    
+                    # Rotate funny message every 5 posts
+                    if (idx + 1) % 5 == 0:
+                        joke_placeholder.markdown(
+                            f'<div class="loading-joke">{random.choice(FUNNY_MESSAGES)}</div>',
+                            unsafe_allow_html=True
+                        )
+    
+                    time.sleep(1.2)
+    
+                joke_placeholder.empty()
+                status_text.empty()
+    
+            result_df = pd.DataFrame(results)
+    
+            # Put original columns first, then appended metric columns at the end
+            orig_cols = list(df.columns)
+            metric_cols = ["Platform","Impressions","Engagement","Likes",
+                           "Retweets_Shares","Quotes","Bookmarks_Saves","Replies_Comments","Content","Is_Article","Media_URLs","Error"]
+            final_cols = orig_cols + [c for c in metric_cols if c not in orig_cols]
+            result_df = result_df[[c for c in final_cols if c in result_df.columns]]
+    
+            # ── Save to session state so results persist across reruns ──
+            st.session_state["result_df"] = result_df
+            st.session_state["total"]     = total
+            st.session_state["skipped"]   = skipped
+    
+            # ── Auto-run AI scoring immediately after fetch ──
+            valid_criteria = [c for c in criteria_list if c["name"].strip()]
+            if valid_criteria and anthropic_api_key and "Content" in result_df.columns:
+                scored_df   = result_df.copy()
+                score_placeholder = st.empty()
+                score_rows = []
+                for idx_s, txt in enumerate(scored_df["Content"].fillna("")):
+                    score_placeholder.info(f"🤖 AI scoring post {idx_s+1} / {len(scored_df)}...")
+                    is_art   = bool(scored_df.get("Is_Article",  pd.Series([False]*len(scored_df))).iloc[idx_s]) if "Is_Article"  in scored_df.columns else False
+                    med_raw  = scored_df.get("Media_URLs",  pd.Series([""]*len(scored_df))).iloc[idx_s] if "Media_URLs" in scored_df.columns else ""
+                    med_list = [u.strip() for u in str(med_raw).split(",") if u.strip() and u.strip() != "nan"]
+                    score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key, is_article=is_art, media_urls=med_list))
+                    time.sleep(2.0)  # Avoid rate limiting — retry logic handles 429 if hit
+                score_placeholder.empty()
+                score_df = pd.DataFrame(score_rows)
+                # Separate AI Thoughts from score columns
+                ai_thoughts_col = score_df.pop("AI Thoughts") if "AI Thoughts" in score_df.columns else pd.Series([""] * len(score_df))
+                score_df.columns = [f"Score: {c}" for c in score_df.columns]
+                score_df["Total Score"] = score_df.sum(axis=1).round(2)
+                # Insert AI Thoughts BEFORE score columns
+                scored_df.insert(len(scored_df.columns), "AI Thoughts", ai_thoughts_col.values)
+                for col in score_df.columns:
+                    scored_df[col] = score_df[col].values
+                max_possible = sum(c["max_score"] * (c["weight"] / 100) for c in valid_criteria)
+                st.session_state["scored_df"]      = scored_df
+                st.session_state["max_possible"]   = max_possible
+                st.session_state["valid_criteria"] = valid_criteria
+                st.success("✅ AI scoring complete!")
+            elif valid_criteria and not anthropic_api_key:
+                st.warning("⚠️ Enter your Anthropic API key above to enable AI scoring.")
+    
+    # ── Display results — unified table (metrics + AI scoring merged) ──
+    if "result_df" in st.session_state:
+        result_df      = st.session_state["result_df"]
+        total          = st.session_state["total"]
+        skipped        = st.session_state["skipped"]
+        # Use scored_df if available, otherwise plain result_df
+        display_df     = st.session_state.get("scored_df", result_df)
+        max_possible   = st.session_state.get("max_possible", None)
+        valid_criteria = st.session_state.get("valid_criteria", [])
+        has_scoring    = "scored_df" in st.session_state
+    
+        st.markdown('<div class="section-label">📊 Results</div>', unsafe_allow_html=True)
+    
+        # ── Stats pills ──
+        x_rows = display_df[display_df["Platform"] == "X/Twitter"]
+        total_impressions = x_rows["Impressions"].replace("", 0).astype(float).sum()
+        total_engagement  = x_rows["Engagement"].replace("", 0).astype(float).sum()
+        total_likes       = x_rows["Likes"].replace("", 0).astype(float).sum()
+        success_count     = len(x_rows[x_rows["Error"] == ""])
+    
+        pills = f"""
+        <div class="stat-row">
+          <div class="stat-pill"><strong>{total}</strong>Total Rows</div>
+          <div class="stat-pill"><strong>{total - skipped}</strong>Links Scanned</div>
+          <div class="stat-pill"><strong>{skipped}</strong>Skipped</div>
+          <div class="stat-pill"><strong>{success_count}</strong>Fetched OK</div>
+          <div class="stat-pill"><strong>{int(total_impressions):,}</strong>Total Impressions</div>
+          <div class="stat-pill"><strong>{int(total_engagement):,}</strong>Total Engagement</div>
+          <div class="stat-pill"><strong>{int(total_likes):,}</strong>Total Likes</div>"""
+        if has_scoring and max_possible and "Total Score" in display_df.columns and len(x_rows) > 0:
+            avg_score = x_rows["Total Score"].mean()
+            pills += f"""
+          <div class="stat-pill"><strong>{max_possible:.1f}</strong>Max Possible Score</div>
+          <div class="stat-pill"><strong>{avg_score:.1f}</strong>Avg Score (X posts)</div>"""
+        pills += "\n    </div>"
+        st.markdown(pills, unsafe_allow_html=True)
+    
+        # ── Scoring criteria summary (if scoring ran) ──
+        if has_scoring and valid_criteria:
+            with st.expander("📐 Scoring Criteria Summary", expanded=False):
+                crit_summary = pd.DataFrame([{
+                    "Criterion":    c["name"],
+                    "Weight":       c["weight"],
+                    "Max Score":    c["max_score"],
+                    "Weighted Max": round(c["max_score"] * (c["weight"] / 100), 2)
+                } for c in valid_criteria])
+                st.dataframe(crit_summary, use_container_width=True, hide_index=True)
+    
+        # ── Single download button ──
+        fname = f"mantle_{'scored' if has_scoring else 'metrics'}_{time.strftime('%Y%m%d_%H%M')}.xlsx"
+        dl_out = BytesIO()
+        with pd.ExcelWriter(dl_out, engine="openpyxl") as writer:
+            display_df.to_excel(writer, index=False)
+        st.download_button("⬇️ Download Excel", dl_out.getvalue(), fname)
+    
+        # ── Single unified table ──
+        st.dataframe(display_df, use_container_width=True)
+    
+    # ====================== FOOTER =======================
+    st.markdown("""
+    <div style="margin-top:48px; padding-top:20px; border-top:1px solid #D1EEE0;
+                display:flex; justify-content:space-between; align-items:center;
+                color:#4A7A5E; font-size:0.78rem; font-weight:500;">
+      <span>Post Checker · Mantle Internal Tool</span>
+      <span>Supports X / Twitter · More platforms coming soon</span>
+      <span>Issues? Reach out to <strong style="color:#0A2818">Minh Anh</strong></span>
+    </div>
+    """, unsafe_allow_html=True)
 
-                    platform = get_platform(link)
-                    status_text.markdown(
-                        f'<p style="color:#4A7A5E;font-size:0.82rem;font-weight:500;">'
-                        f'Processing {idx+1} / {total} &nbsp;·&nbsp; {link[:60]}{"…" if len(link)>60 else ""}</p>',
-                        unsafe_allow_html=True
-                    )
+# ====================== TAB: FAKE ENGAGEMENT DETECTOR ======================
+with tab_fake:
+    import re as _re
 
-                    orig_row["Platform"]        = platform
-                    orig_row["Impressions"]      = 0
-                    orig_row["Engagement"]       = 0
-                    orig_row["Likes"]            = 0
-                    orig_row["Retweets_Shares"]  = 0
-                    orig_row["Quotes"]           = 0
-                    orig_row["Bookmarks_Saves"]  = 0
-                    orig_row["Replies_Comments"] = 0
-                    orig_row["Content"]          = ""
-                    orig_row["Error"]            = ""
+    st.markdown("""
+    <div class="mantle-card">
+      <p style="color:#0A2818;font-size:0.88rem;margin:0 0 12px;">
+        Analyze tweets to detect fake/farmed engagement. Scores are cumulative — the higher the score, the more suspicious the post.
+      </p>
+      <table style="width:100%;border-collapse:collapse;font-size:0.82rem;">
+        <thead>
+          <tr style="border-bottom:1px solid #D1EEE0;">
+            <th style="text-align:left;padding:8px 12px;color:#4A7A5E;font-weight:600;font-size:0.72rem;text-transform:uppercase;">Signal</th>
+            <th style="text-align:left;padding:8px 12px;color:#4A7A5E;font-weight:600;font-size:0.72rem;text-transform:uppercase;">Condition</th>
+            <th style="text-align:left;padding:8px 12px;color:#4A7A5E;font-weight:600;font-size:0.72rem;text-transform:uppercase;">Points</th>
+            <th style="text-align:left;padding:8px 12px;color:#4A7A5E;font-weight:600;font-size:0.72rem;text-transform:uppercase;">Note</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr style="border-bottom:1px solid #D1EEE0;"><td style="padding:8px 12px;font-weight:600;">Views/Likes Ratio</td><td style="padding:8px 12px;">Views / Likes &gt; 150:1</td><td style="padding:8px 12px;color:#C0392B;font-weight:600;">+30</td><td style="padding:8px 12px;color:#4A7A5E;">View farming</td></tr>
+          <tr style="border-bottom:1px solid #D1EEE0;"><td style="padding:8px 12px;font-weight:600;">Replies vs Likes</td><td style="padding:8px 12px;">Replies &gt; Likes × 1.5</td><td style="padding:8px 12px;color:#C0392B;font-weight:600;">+25</td><td style="padding:8px 12px;color:#4A7A5E;">Reply farming / pod</td></tr>
+          <tr style="border-bottom:1px solid #D1EEE0;"><td style="padding:8px 12px;font-weight:600;">RT vs Likes</td><td style="padding:8px 12px;">RT &gt; Likes × 3</td><td style="padding:8px 12px;color:#C0392B;font-weight:600;">+20</td><td style="padding:8px 12px;color:#4A7A5E;">RT farm</td></tr>
+          <tr style="border-bottom:1px solid #D1EEE0;"><td style="padding:8px 12px;font-weight:600;">Reply Volume</td><td style="padding:8px 12px;">Replies &gt; 300</td><td style="padding:8px 12px;color:#C0392B;font-weight:600;">+15</td><td style="padding:8px 12px;color:#4A7A5E;">Abnormal reply volume</td></tr>
+          <tr><td style="padding:8px 12px;font-weight:700;">Max</td><td></td><td style="padding:8px 12px;font-weight:700;">90</td><td></td></tr>
+        </tbody>
+      </table>
+      <div style="margin-top:10px;font-size:0.82rem;color:#4A7A5E;">
+        Threshold: ≥70 🔴 Heavy farming &nbsp;·&nbsp; 35–69 🟡 Farming detected &nbsp;·&nbsp; &lt;35 🟢 Organic
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
-                    if platform == "X/Twitter":
-                        tid = extract_tweet_id(link)
-                        if tid:
-                            metrics = fetch_x_metrics(tid)
-                            orig_row.update({
-                                "Impressions":      metrics["impressions"],
-                                "Likes":            metrics["likes"],
-                                "Retweets_Shares":  metrics["retweets"],
-                                "Quotes":           metrics["quotes"],
-                                "Bookmarks_Saves":  metrics["bookmarks"],
-                                "Replies_Comments": metrics["replies"],
-                                "Engagement":       metrics["engagement"],
-                                "Content":          metrics["content"],
-                                "Is_Article":       metrics.get("is_article", False),
-                                "Media_URLs":       ", ".join(metrics.get("media_urls", [])),
-                                "Error":            metrics.get("error", "")
-                            })
+    # ── Helpers ──
+    def _extract_tid_fake(val):
+        val = str(val).strip().split("?")[0]
+        if val.isdigit(): return val
+        m = _re.search(r"/status/(\d+)", val)
+        return m.group(1) if m else None
 
-                    results.append(orig_row)
+    def _fetch_metrics_fake(tid):
+        try:
+            resp = requests.get(
+                f"https://api.fxtwitter.com/status/{tid}",
+                headers={"User-Agent": "Mantle-Fake-Detector/1.0"},
+                timeout=12
+            )
+            if resp.status_code == 200:
+                tweet = resp.json().get("tweet") or {}
+                return {
+                    "views":    tweet.get("views", 0) or 0,
+                    "likes":    tweet.get("likes", 0) or 0,
+                    "retweets": tweet.get("retweets", 0) or 0,
+                    "replies":  tweet.get("replies", 0) or 0,
+                    "error": ""
+                }
+            return {"views":0,"likes":0,"retweets":0,"replies":0,"error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            return {"views":0,"likes":0,"retweets":0,"replies":0,"error": str(e)[:80]}
 
-                except Exception as e:
-                    # Any unexpected error → skip this row silently
-                    skipped += 1
-                    try:
-                        orig_row = df.iloc[idx].to_dict()
-                    except Exception:
-                        orig_row = {}
-                    orig_row["Platform"]        = "Skipped"
-                    orig_row["Impressions"]      = ""
-                    orig_row["Engagement"]       = ""
-                    orig_row["Likes"]            = ""
-                    orig_row["Retweets_Shares"]  = ""
-                    orig_row["Quotes"]           = ""
-                    orig_row["Bookmarks_Saves"]  = ""
-                    orig_row["Replies_Comments"] = ""
-                    orig_row["Content"]          = ""
-                    orig_row["Error"]            = f"Skipped — {str(e)[:80]}"
-                    results.append(orig_row)
+    def _calc_fake_score(m):
+        views, likes, rts, replies = m["views"], m["likes"], m["retweets"], m["replies"]
+        total = 0
+        breakdown = []
 
-                progress_bar.progress(min(100, int((idx + 1) / total * 100)))
+        if likes > 0:
+            vlr = views / likes
+            if vlr > 150:
+                pts, note = 30, "View farming"
+            else:
+                pts, note = 0, ""
+        elif views > 0:
+            pts, note = 30, "View farming"
+        else:
+            pts, note = 0, ""
+        breakdown.append(("Views/Likes", note))
+        total += pts
 
-                # Rotate funny message every 5 posts
-                if (idx + 1) % 5 == 0:
-                    joke_placeholder.markdown(
-                        f'<div class="loading-joke">{random.choice(FUNNY_MESSAGES)}</div>',
-                        unsafe_allow_html=True
-                    )
+        if likes > 0 and replies > likes * 1.5:
+            pts, note = 25, "Reply farming / pod"
+        else:
+            pts, note = 0, ""
+        breakdown.append(("Replies vs Likes", note))
+        total += pts
 
-                time.sleep(1.2)
+        if likes > 0 and rts > likes * 3:
+            pts, note = 20, "RT farm"
+        else:
+            pts, note = 0, ""
+        breakdown.append(("RT vs Likes", note))
+        total += pts
 
-            joke_placeholder.empty()
-            status_text.empty()
+        if replies > 300:
+            pts, note = 15, "Abnormal reply volume"
+        else:
+            pts, note = 0, ""
+        breakdown.append(("Reply Volume", note))
+        total += pts
 
-        result_df = pd.DataFrame(results)
+        total = min(total, 100)
+        any_triggered = any(n != "" for _, n in breakdown)
 
-        # Put original columns first, then appended metric columns at the end
-        orig_cols = list(df.columns)
-        metric_cols = ["Platform","Impressions","Engagement","Likes",
-                       "Retweets_Shares","Quotes","Bookmarks_Saves","Replies_Comments","Content","Is_Article","Media_URLs","Error"]
-        final_cols = orig_cols + [c for c in metric_cols if c not in orig_cols]
-        result_df = result_df[[c for c in final_cols if c in result_df.columns]]
+        if total >= 70:
+            verdict = "🔴 HEAVY FARMING"
+        elif total >= 35 or any_triggered:
+            verdict = "🟡 FARMING DETECTED"
+        else:
+            verdict = "🟢 ORGANIC"
 
-        # ── Save to session state so results persist across reruns ──
-        st.session_state["result_df"] = result_df
-        st.session_state["total"]     = total
-        st.session_state["skipped"]   = skipped
+        return total, verdict, breakdown
 
-        # ── Auto-run AI scoring immediately after fetch ──
-        valid_criteria = [c for c in criteria_list if c["name"].strip()]
-        if valid_criteria and anthropic_api_key and "Content" in result_df.columns:
-            scored_df   = result_df.copy()
-            score_placeholder = st.empty()
-            score_rows = []
-            for idx_s, txt in enumerate(scored_df["Content"].fillna("")):
-                score_placeholder.info(f"🤖 AI scoring post {idx_s+1} / {len(scored_df)}...")
-                is_art   = bool(scored_df.get("Is_Article",  pd.Series([False]*len(scored_df))).iloc[idx_s]) if "Is_Article"  in scored_df.columns else False
-                med_raw  = scored_df.get("Media_URLs",  pd.Series([""]*len(scored_df))).iloc[idx_s] if "Media_URLs" in scored_df.columns else ""
-                med_list = [u.strip() for u in str(med_raw).split(",") if u.strip() and u.strip() != "nan"]
-                score_rows.append(score_content_ai(txt, valid_criteria, anthropic_api_key, is_article=is_art, media_urls=med_list))
-                time.sleep(2.0)  # Avoid rate limiting — retry logic handles 429 if hit
-            score_placeholder.empty()
-            score_df = pd.DataFrame(score_rows)
-            # Separate AI Thoughts from score columns
-            ai_thoughts_col = score_df.pop("AI Thoughts") if "AI Thoughts" in score_df.columns else pd.Series([""] * len(score_df))
-            score_df.columns = [f"Score: {c}" for c in score_df.columns]
-            score_df["Total Score"] = score_df.sum(axis=1).round(2)
-            # Insert AI Thoughts BEFORE score columns
-            scored_df.insert(len(scored_df.columns), "AI Thoughts", ai_thoughts_col.values)
-            for col in score_df.columns:
-                scored_df[col] = score_df[col].values
-            max_possible = sum(c["max_score"] * (c["weight"] / 100) for c in valid_criteria)
-            st.session_state["scored_df"]      = scored_df
-            st.session_state["max_possible"]   = max_possible
-            st.session_state["valid_criteria"] = valid_criteria
-            st.success("✅ AI scoring complete!")
-        elif valid_criteria and not anthropic_api_key:
-            st.warning("⚠️ Enter your Anthropic API key above to enable AI scoring.")
+    # ── Input mode ──
+    fake_mode = st.radio(
+        "Input method:",
+        ["📋 Paste links directly", "📂 Upload Excel file"],
+        horizontal=True,
+        key="fake_mode_v2"
+    )
 
-# ── Display results — unified table (metrics + AI scoring merged) ──
-if "result_df" in st.session_state:
-    result_df      = st.session_state["result_df"]
-    total          = st.session_state["total"]
-    skipped        = st.session_state["skipped"]
-    # Use scored_df if available, otherwise plain result_df
-    display_df     = st.session_state.get("scored_df", result_df)
-    max_possible   = st.session_state.get("max_possible", None)
-    valid_criteria = st.session_state.get("valid_criteria", [])
-    has_scoring    = "scored_df" in st.session_state
+    fake_df_in   = None
+    fake_url_col = None
 
-    st.markdown('<div class="section-label">📊 Results</div>', unsafe_allow_html=True)
+    if fake_mode == "📋 Paste links directly":
+        fake_pasted = st.text_area(
+            "Paste tweet links here (one per line)",
+            placeholder="https://x.com/user/status/123456\nhttps://x.com/user/status/789012",
+            height=140,
+            key="fake_paste_v2"
+        )
+        if fake_pasted and fake_pasted.strip():
+            fake_lines   = [l.strip() for l in fake_pasted.strip().splitlines() if l.strip()]
+            fake_df_in   = pd.DataFrame({"Tweet URL": fake_lines})
+            fake_url_col = "Tweet URL"
+            st.caption(f"**{len(fake_lines)} links** detected")
+    else:
+        fake_uploaded = st.file_uploader(
+            "Upload Excel file containing tweet links",
+            type=["xlsx", "xls"],
+            key="fake_uploader_v2"
+        )
+        if fake_uploaded:
+            try:
+                fake_df_in = pd.read_excel(fake_uploaded)
+            except Exception as e:
+                st.error(f"Could not read file: {e}")
+                st.stop()
+            for col in fake_df_in.columns:
+                hits = fake_df_in[col].dropna().astype(str).str.contains(
+                    r"x\.com.*status|twitter\.com.*status|\d{15,}", regex=True).sum()
+                if hits > 0:
+                    fake_url_col = col
+                    break
+            if fake_url_col is None:
+                st.error("No tweet URL column found.")
+                fake_df_in = None
+            else:
+                st.success(f"**{len(fake_df_in)} rows** loaded · URL column: **`{fake_url_col}`**")
 
-    # ── Stats pills ──
-    x_rows = display_df[display_df["Platform"] == "X/Twitter"]
-    total_impressions = x_rows["Impressions"].replace("", 0).astype(float).sum()
-    total_engagement  = x_rows["Engagement"].replace("", 0).astype(float).sum()
-    total_likes       = x_rows["Likes"].replace("", 0).astype(float).sum()
-    success_count     = len(x_rows[x_rows["Error"] == ""])
+    # ── Run ──
+    if fake_df_in is not None and fake_url_col is not None:
+        if st.button("🚀 Start Analysis", type="primary", key="fake_run_v2"):
+            fake_results = []
+            fake_prog    = st.progress(0, text="Analyzing...")
+            fake_status  = st.empty()
+            fake_total   = len(fake_df_in)
 
-    pills = f"""
-    <div class="stat-row">
-      <div class="stat-pill"><strong>{total}</strong>Total Rows</div>
-      <div class="stat-pill"><strong>{total - skipped}</strong>Links Scanned</div>
-      <div class="stat-pill"><strong>{skipped}</strong>Skipped</div>
-      <div class="stat-pill"><strong>{success_count}</strong>Fetched OK</div>
-      <div class="stat-pill"><strong>{int(total_impressions):,}</strong>Total Impressions</div>
-      <div class="stat-pill"><strong>{int(total_engagement):,}</strong>Total Engagement</div>
-      <div class="stat-pill"><strong>{int(total_likes):,}</strong>Total Likes</div>"""
-    if has_scoring and max_possible and "Total Score" in display_df.columns and len(x_rows) > 0:
-        avg_score = x_rows["Total Score"].mean()
-        pills += f"""
-      <div class="stat-pill"><strong>{max_possible:.1f}</strong>Max Possible Score</div>
-      <div class="stat-pill"><strong>{avg_score:.1f}</strong>Avg Score (X posts)</div>"""
-    pills += "\n    </div>"
-    st.markdown(pills, unsafe_allow_html=True)
+            for i, (_, row) in enumerate(fake_df_in.iterrows()):
+                raw   = str(row[fake_url_col]).strip()
+                tid   = _extract_tid_fake(raw)
+                extra = {c: row[c] for c in fake_df_in.columns if c != fake_url_col}
 
-    # ── Scoring criteria summary (if scoring ran) ──
-    if has_scoring and valid_criteria:
-        with st.expander("📐 Scoring Criteria Summary", expanded=False):
-            crit_summary = pd.DataFrame([{
-                "Criterion":    c["name"],
-                "Weight":       c["weight"],
-                "Max Score":    c["max_score"],
-                "Weighted Max": round(c["max_score"] * (c["weight"] / 100), 2)
-            } for c in valid_criteria])
-            st.dataframe(crit_summary, use_container_width=True, hide_index=True)
+                if not tid:
+                    fake_results.append({**extra, "Tweet URL": raw, "Views":0,"Likes":0,
+                        "Retweets":0,"Replies":0,"Cheating Score":0,"Conclusion":"❌ Invalid URL"})
+                    fake_prog.progress((i+1)/fake_total)
+                    continue
 
-    # ── Single download button ──
-    fname = f"mantle_{'scored' if has_scoring else 'metrics'}_{time.strftime('%Y%m%d_%H%M')}.xlsx"
-    dl_out = BytesIO()
-    with pd.ExcelWriter(dl_out, engine="openpyxl") as writer:
-        display_df.to_excel(writer, index=False)
-    st.download_button("⬇️ Download Excel", dl_out.getvalue(), fname)
+                fake_status.markdown(f"⏳ **{i+1}/{fake_total}** — `{raw}`")
+                m = _fetch_metrics_fake(tid)
 
-    # ── Single unified table ──
-    st.dataframe(display_df, use_container_width=True)
+                if m["error"]:
+                    fake_results.append({**extra, "Tweet URL": raw, "Views":0,"Likes":0,
+                        "Retweets":0,"Replies":0,"Cheating Score":0,"Conclusion":f"❌ Error: {m['error']}"})
+                else:
+                    score, verdict, breakdown = _calc_fake_score(m)
+                    row_out = {**extra,
+                        "Tweet URL": raw,
+                        "Views": m["views"], "Likes": m["likes"],
+                        "Retweets": m["retweets"], "Replies": m["replies"],
+                        "Cheating Score": score, "Conclusion": verdict,
+                    }
+                    for sig_name, note in breakdown:
+                        row_out[f"Signal: {sig_name}"] = note
+                    fake_results.append(row_out)
 
-# ====================== FOOTER =======================
-st.markdown("""
-<div style="margin-top:48px; padding-top:20px; border-top:1px solid #D1EEE0;
-            display:flex; justify-content:space-between; align-items:center;
-            color:#4A7A5E; font-size:0.78rem; font-weight:500;">
-  <span>Post Checker · Mantle Internal Tool</span>
-  <span>Supports X / Twitter · More platforms coming soon</span>
-  <span>Issues? Reach out to <strong style="color:#0A2818">Minh Anh</strong></span>
-</div>
-""", unsafe_allow_html=True)
+                fake_prog.progress((i+1)/fake_total, text=f"{i+1}/{fake_total} done")
+                time.sleep(1.0)
+
+            fake_status.empty()
+            fake_prog.progress(1.0, text="✅ Done!")
+            st.session_state["fake_df_out"] = pd.DataFrame(fake_results)
+
+    # ── Results ──
+    if "fake_df_out" in st.session_state:
+        fdf = st.session_state["fake_df_out"]
+        n_heavy = fdf["Conclusion"].str.contains("HEAVY", na=False).sum()
+        n_farm  = fdf["Conclusion"].str.contains("FARMING DETECTED", na=False).sum()
+        n_org   = fdf["Conclusion"].str.contains("ORGANIC", na=False).sum()
+
+        st.markdown(f"""
+        <div class="stat-row">
+          <div class="stat-pill"><strong>{n_heavy}</strong>🔴 Heavy Farming</div>
+          <div class="stat-pill"><strong>{n_farm}</strong>🟡 Farming Detected</div>
+          <div class="stat-pill"><strong>{n_org}</strong>🟢 Organic</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        fake_out = io.BytesIO()
+        with pd.ExcelWriter(fake_out, engine="openpyxl") as writer:
+            fdf.to_excel(writer, index=False)
+        st.download_button("⬇️ Export results to Excel", fake_out.getvalue(),
+                           f"mantle_fake_engagement_{time.strftime('%Y%m%d_%H%M')}.xlsx",
+                           key="fake_download_v2")
+
+        st.dataframe(fdf, use_container_width=True)
